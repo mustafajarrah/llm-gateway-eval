@@ -181,8 +181,16 @@ func TestListOptionsNormalize(t *testing.T) {
 }
 
 func TestEnumValidity(t *testing.T) {
-	if !ProviderOpenAI.Valid() || !ProviderAnthropic.Valid() || Provider("x").Valid() {
-		t.Error("Provider.Valid() misclassified a value")
+	for _, p := range []Provider{
+		ProviderOpenAI, ProviderAnthropic, ProviderGemini, ProviderMistral,
+		ProviderOllama, ProviderOpenAICompatible,
+	} {
+		if !p.Valid() {
+			t.Errorf("Provider(%q).Valid() = false, want true", p)
+		}
+	}
+	if Provider("x").Valid() || Provider("").Valid() {
+		t.Error("Provider.Valid() accepted an unknown value")
 	}
 	if ProviderOpenAI.String() != "openai" {
 		t.Errorf("Provider.String() = %q", ProviderOpenAI.String())

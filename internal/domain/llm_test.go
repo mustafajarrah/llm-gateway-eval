@@ -24,7 +24,7 @@ func TestLLMRequestValidate(t *testing.T) {
 	}{
 		{name: "valid", mutate: func(*LLMRequest) {}},
 		{name: "valid with pinned provider", mutate: func(r *LLMRequest) { r.Provider = ProviderAnthropic }},
-		{name: "unknown provider", mutate: func(r *LLMRequest) { r.Provider = "gemini" }, wantErr: true},
+		{name: "unknown provider", mutate: func(r *LLMRequest) { r.Provider = "cohere" }, wantErr: true},
 		{name: "missing model", mutate: func(r *LLMRequest) { r.Model = "" }, wantErr: true},
 		{name: "no messages", mutate: func(r *LLMRequest) { r.Messages = nil }, wantErr: true},
 		{name: "invalid role", mutate: func(r *LLMRequest) { r.Messages[0].Role = "system" }, wantErr: true},

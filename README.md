@@ -2,7 +2,7 @@
 
 A provider-agnostic LLM gateway with a built-in prompt evaluation suite, written in Go.
 
-The gateway puts OpenAI and Anthropic behind a single request/response contract with fallback between providers. The evaluation suite versions prompt templates, replays test cases against every version, and records the results so regressions are visible before a prompt change ships.
+The gateway puts several LLM vendors behind a single request/response contract with fallback between providers. The evaluation suite versions prompt templates, replays test cases against every version, and records the results so regressions are visible before a prompt change ships.
 
 > **Status: early development.** Only the domain layer exists today. Provider adapters, persistence, the evaluation runner and the HTTP API are not implemented yet. See the [roadmap](#roadmap).
 
@@ -18,6 +18,19 @@ This project addresses both in one service:
 - **Regression testing for prompts.** Test cases belong to the prompt, not to a version, so the same suite runs against every version.
 - **Traceable results.** Each result records the exact prompt version, the provider and model that actually served it, token usage and latency.
 
+## Providers
+
+The domain recognises the providers below. None has an adapter yet.
+
+| Identifier | Provider |
+| --- | --- |
+| `openai` | OpenAI |
+| `anthropic` | Anthropic |
+| `gemini` | Google Gemini |
+| `mistral` | Mistral |
+| `ollama` | Ollama (locally hosted models, no API key) |
+| `openai_compatible` | Any endpoint speaking the OpenAI chat completions protocol at a configurable base URL (Groq, OpenRouter, Together, vLLM, Azure OpenAI, ...) |
+
 ## Architecture
 
 The project follows Clean Architecture. The domain package is the innermost ring: it depends only on the standard library and defines the ports that outer layers implement.
@@ -26,7 +39,7 @@ The project follows Clean Architecture. The domain package is the innermost ring
 flowchart LR
     HTTP["HTTP API<br/>(planned)"] --> SVC["Services<br/>gateway routing, evaluation runner<br/>(planned)"]
     SVC --> DOM["Domain<br/>entities + ports"]
-    PROV["Provider adapters<br/>OpenAI, Anthropic<br/>(planned)"] -. implements LLMProvider .-> DOM
+    PROV["Provider adapters<br/>one per provider<br/>(planned)"] -. implements LLMProvider .-> DOM
     REPO["Repositories<br/>(planned)"] -. implements PromptRepository,<br/>EvaluationRepository .-> DOM
 ```
 
@@ -120,7 +133,7 @@ internal/
 ## Roadmap
 
 - [x] Domain entities, validation and ports
-- [ ] OpenAI and Anthropic provider adapters
+- [ ] Provider adapters (OpenAI, Anthropic, Gemini, Mistral, Ollama, OpenAI-compatible)
 - [ ] Gateway routing with retries and provider fallback
 - [ ] Repository implementation
 - [ ] Evaluation runner (execute a suite against a prompt version)

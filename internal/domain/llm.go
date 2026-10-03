@@ -14,12 +14,21 @@ type Provider string
 const (
 	ProviderOpenAI    Provider = "openai"
 	ProviderAnthropic Provider = "anthropic"
+	ProviderGemini    Provider = "gemini"
+	ProviderMistral   Provider = "mistral"
+	// ProviderOllama serves locally hosted models; it needs no API key.
+	ProviderOllama Provider = "ollama"
+	// ProviderOpenAICompatible is any endpoint speaking the OpenAI chat
+	// completions protocol at a configurable base URL (Groq, OpenRouter,
+	// Together, vLLM, Azure OpenAI, ...).
+	ProviderOpenAICompatible Provider = "openai_compatible"
 )
 
 // Valid reports whether p is a provider known to the gateway.
 func (p Provider) Valid() bool {
 	switch p {
-	case ProviderOpenAI, ProviderAnthropic:
+	case ProviderOpenAI, ProviderAnthropic, ProviderGemini, ProviderMistral,
+		ProviderOllama, ProviderOpenAICompatible:
 		return true
 	default:
 		return false
@@ -34,7 +43,7 @@ type Role string
 
 // Conversation roles. System instructions are carried separately in
 // LLMRequest.SystemPrompt because providers disagree on how to transmit them
-// (OpenAI uses a message, Anthropic a top-level field).
+// (OpenAI-style APIs use a message, Anthropic and Gemini a top-level field).
 const (
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
