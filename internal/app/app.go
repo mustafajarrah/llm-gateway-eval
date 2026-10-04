@@ -50,6 +50,7 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*App, er
 	}
 	gw, err := gateway.New(providers, gateway.Config{
 		Routes:           cfg.Routes,
+		Prices:           cfg.Prices,
 		MaxAttempts:      cfg.MaxAttempts,
 		AttemptTimeout:   cfg.AttemptTimeout,
 		BreakerThreshold: cfg.BreakerThreshold,

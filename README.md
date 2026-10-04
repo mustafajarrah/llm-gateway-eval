@@ -16,7 +16,7 @@ This project addresses both in one service:
 - **Retries and fallback.** Transient failures are retried with backoff; a named route falls back from one provider to the next, each with its own model.
 - **Immutable prompt versions.** Every change to a template, system prompt, model or sampling parameter creates a new numbered version.
 - **Regression testing for prompts.** Test cases belong to the prompt, not to a version, so the same suite runs against every version and two runs can be compared.
-- **Traceable results.** Each result records the exact prompt version, the provider and model that actually served it, token usage and latency.
+- **Traceable results.** Each result records the exact prompt version, the provider and model that actually served it, token usage, estimated cost and latency.
 
 ## Quick start
 
@@ -95,6 +95,23 @@ Each provider has a circuit breaker, so a provider that is down stops costing ev
 
 `GET /v1/providers` reports each provider's state under `circuits` (`closed`, `open` or `half_open`). The state is kept in memory, per process.
 
+## Cost
+
+The gateway estimates what each completion costs, from the token usage the provider reports and a price table you supply. No prices are built in: vendors change them, and a stale table would produce confident wrong numbers.
+
+```bash
+GATEWAY_PRICES="anthropic:claude-opus-5-5=4/20;openai:gpt-4o-mini=0.15/0.60;ollama:llama3.2=0/0"
+```
+
+Each entry is `provider:model=input/output`, in US dollars per million tokens.
+
+- A completion served by a priced target carries `cost_usd`; one served by an unpriced target has no `cost_usd` field at all, rather than a misleading zero.
+- Each evaluation result stores its cost, and a run's summary adds them up in `cost_usd`. `unpriced` counts the results that used tokens but had no price, so a non-zero value means the total understates the run.
+- Along a route, the price applied is that of the target that actually served the request.
+- Costs are fixed when recorded. Changing a price later does not rewrite past runs.
+
+The figure is an estimate: every input token is billed at the plain input rate, so vendor discounts such as cached-prompt or batch pricing are not reflected. Prices are matched on the exact `provider:model` you request.
+
 ## Evaluating prompts
 
 The walkthrough below creates a prompt, a version and two test cases, then runs the suite. It assumes the Ollama setup from the quick start.
@@ -172,7 +189,7 @@ A test case that cannot be executed (template error, provider failure) is record
 | Method and path | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness check (never authenticated) |
-| `GET /v1/providers` | Configured providers, routes and circuit breaker states |
+| `GET /v1/providers` | Configured providers, routes, prices and circuit breaker states |
 | `POST /v1/completions` | Complete through the gateway |
 | `POST /v1/prompts` · `GET /v1/prompts` | Create and list prompts (`?limit=&offset=`) |
 | `GET /v1/prompts/{id}` · `DELETE /v1/prompts/{id}` | Read or delete a prompt; deleting cascades to its versions, test cases, runs and results |
@@ -220,6 +237,7 @@ Everything is configured through environment variables; [.env.example](.env.exam
 | `GATEWAY_ATTEMPT_TIMEOUT` | `60s` | Limit of a single provider call |
 | `GATEWAY_BREAKER_THRESHOLD` | `5` | Consecutive unhealthy calls that open a provider's circuit breaker; `0` disables it |
 | `GATEWAY_BREAKER_COOLDOWN` | `30s` | How long an open breaker skips the provider |
+| `GATEWAY_PRICES` | none | Per-model prices, see [Cost](#cost) |
 | `GATEWAY_EVAL_CONCURRENCY` | `4` | Test cases evaluated in parallel |
 | `ANTHROPIC_MAX_TOKENS` | `16000` | Output limit for Anthropic requests that set none |
 
@@ -302,6 +320,7 @@ Done:
 - [x] Gateway routing with retries, provider fallback and circuit breakers
 - [x] SQLite and in-memory storage
 - [x] Evaluation runner (background or blocking) and run comparison
+- [x] Cost estimation from token usage and configured prices
 - [x] HTTP API, configuration and service binary
 - [x] CI (gofmt, vet, staticcheck, tests, Docker build)
 
@@ -310,7 +329,6 @@ Not done yet:
 - [ ] Verification against the real vendor APIs
 - [ ] Streaming responses
 - [ ] Tool calling and structured output
-- [ ] Cost tracking from token usage
 - [ ] Graded scoring (semantic similarity, LLM-as-judge)
 - [ ] Several `openai_compatible` endpoints at once
 - [ ] Metrics and tracing

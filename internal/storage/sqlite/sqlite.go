@@ -615,14 +615,18 @@ func (s *Store) SaveResults(ctx context.Context, results []domain.EvaluationResu
 			if r.CreatedAt.IsZero() {
 				r.CreatedAt = now
 			}
+			var cost sql.NullFloat64
+			if r.CostUSD != nil {
+				cost = sql.NullFloat64{Float64: *r.CostUSD, Valid: true}
+			}
 			_, err = tx.ExecContext(ctx,
 				`INSERT INTO results
 					(id, run_id, test_case_id, prompt_version_id, provider, model, actual_output, passed, score,
-					 input_tokens, output_tokens, latency_ns, error, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					 input_tokens, output_tokens, latency_ns, error, created_at, cost_usd)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				r.ID, r.RunID, r.TestCaseID, r.PromptVersionID, string(r.Provider), r.Model, r.ActualOutput,
 				r.Passed, r.Score, r.Usage.InputTokens, r.Usage.OutputTokens, int64(r.Latency), r.Error,
-				toUnix(r.CreatedAt))
+				toUnix(r.CreatedAt), cost)
 			if isUnique(err) {
 				return fmt.Errorf("results[%d]: result %q: %w", i, r.ID, domain.ErrConflict)
 			}
@@ -640,7 +644,7 @@ func (s *Store) SaveResults(ctx context.Context, results []domain.EvaluationResu
 }
 
 const resultColumns = `id, run_id, test_case_id, prompt_version_id, provider, model, actual_output, passed, score,
-	input_tokens, output_tokens, latency_ns, error, created_at`
+	input_tokens, output_tokens, latency_ns, error, created_at, cost_usd`
 
 func scanResult(row interface{ Scan(...any) error }) (domain.EvaluationResult, error) {
 	var (
@@ -648,11 +652,15 @@ func scanResult(row interface{ Scan(...any) error }) (domain.EvaluationResult, e
 		provider string
 		latency  int64
 		created  int64
+		cost     sql.NullFloat64
 	)
 	err := row.Scan(&r.ID, &r.RunID, &r.TestCaseID, &r.PromptVersionID, &provider, &r.Model, &r.ActualOutput,
-		&r.Passed, &r.Score, &r.Usage.InputTokens, &r.Usage.OutputTokens, &latency, &r.Error, &created)
+		&r.Passed, &r.Score, &r.Usage.InputTokens, &r.Usage.OutputTokens, &latency, &r.Error, &created, &cost)
 	if err != nil {
 		return r, err
+	}
+	if cost.Valid {
+		r.CostUSD = &cost.Float64
 	}
 	r.Provider = domain.Provider(provider)
 	r.Latency = time.Duration(latency)

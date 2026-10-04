@@ -3,6 +3,8 @@ package evaluation
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,9 +36,13 @@ func echo(_ context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error
 		Model:    "claude-haiku-4-5",
 		Content:  content,
 		Usage:    domain.TokenUsage{InputTokens: 10, OutputTokens: 2},
+		CostUSD:  &echoCost,
 		Latency:  100 * time.Millisecond,
 	}, nil
 }
+
+// echoCost is the cost echo reports for every completion.
+var echoCost = 0.25
 
 type fixture struct {
 	store  *memory.Store
@@ -53,7 +59,7 @@ func newFixture(t *testing.T, llm Completer, template string) *fixture {
 	}
 	f := &fixture{store: store, prompt: prompt}
 	f.addVersion(t, template)
-	runner, err := NewRunner(store, store, llm, Config{Concurrency: 2})
+	runner, err := NewRunner(store, store, llm, Config{Concurrency: 2, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		t.Fatalf("NewRunner() error = %v", err)
 	}
@@ -109,6 +115,7 @@ func TestRun(t *testing.T) {
 	wantSummary := domain.RunSummary{
 		Total: 4, Passed: 1, Failed: 1, Errored: 2,
 		Usage:          domain.TokenUsage{InputTokens: 20, OutputTokens: 4},
+		CostUSD:        0.5,
 		TotalLatencyMS: 200,
 	}
 	if run.Summary != wantSummary {
@@ -128,6 +135,9 @@ func TestRun(t *testing.T) {
 	if !got[0].Passed || got[0].Score != 1 || got[0].ActualOutput != "Paris" ||
 		got[0].Provider != domain.ProviderAnthropic || got[0].Model != "claude-haiku-4-5" || got[0].Latency != 100*time.Millisecond {
 		t.Errorf("passing result = %+v, want it to record what actually served the request", got[0])
+	}
+	if got[0].CostUSD == nil || *got[0].CostUSD != 0.25 || got[2].CostUSD != nil {
+		t.Errorf("costs = %v and %v, want the completion's cost recorded and none for a failed call", got[0].CostUSD, got[2].CostUSD)
 	}
 	if got[1].Passed || got[1].Score != 0 || got[1].Error != "" || got[1].ActualOutput != "Berlin" {
 		t.Errorf("failing result = %+v", got[1])

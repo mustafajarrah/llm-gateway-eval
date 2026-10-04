@@ -276,6 +276,7 @@ func (r *Runner) executeCase(ctx context.Context, run *domain.EvaluationRun, v *
 	result.Model = resp.Model
 	result.ActualOutput = resp.Content
 	result.Usage = resp.Usage
+	result.CostUSD = resp.CostUSD
 	result.Latency = resp.Latency
 
 	passed, err := tc.Matches(resp.Content)

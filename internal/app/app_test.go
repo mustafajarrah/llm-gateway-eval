@@ -81,6 +81,10 @@ func TestEndToEnd(t *testing.T) {
 			{Provider: domain.ProviderOllama, Model: "flaky"},
 		}}},
 		MaxAttempts: 2,
+		Prices: []domain.ModelPrice{{
+			Target: domain.Target{Provider: domain.ProviderOpenAICompatible, Model: "any"},
+			Price:  domain.Price{InputPerMTok: 1000, OutputPerMTok: 2000},
+		}},
 	}
 	app, err := New(context.Background(), cfg, quiet)
 	if err != nil {
@@ -118,6 +122,14 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if usage := summary["usage"].(map[string]any); usage["input_tokens"] != 14.0 || usage["output_tokens"] != 6.0 {
 		t.Errorf("usage = %v, want the two calls summed", usage)
+	}
+	// 14 input tokens at $1000/MTok plus 6 output tokens at $2000/MTok.
+	if cost := summary["cost_usd"].(float64); cost < 0.0259 || cost > 0.0261 || summary["unpriced"] != 0.0 {
+		t.Errorf("cost = %v (unpriced %v), want 0.026 and nothing unpriced", cost, summary["unpriced"])
+	}
+	// The route target has no price, so its completion carried no cost.
+	if _, priced := completion["cost_usd"]; priced {
+		t.Errorf("completion = %v, want no cost_usd for an unpriced target", completion)
 	}
 
 	stored := call(t, h, "GET", "/v1/runs/"+run["id"].(string), "", http.StatusOK)

@@ -384,6 +384,51 @@ func TestCircuitBreakerDisabled(t *testing.T) {
 	}
 }
 
+func TestCompleteEstimatesCost(t *testing.T) {
+	usage := domain.TokenUsage{InputTokens: 1_000_000, OutputTokens: 500_000}
+	answer := func(p domain.Provider) result {
+		return result{resp: &domain.LLMResponse{Provider: p, Model: "dated-variant-2026", Usage: usage}}
+	}
+	openai := &fakeProvider{name: domain.ProviderOpenAI, script: []result{fail(domain.ProviderOpenAI, 503, true)}}
+	anthropic := &fakeProvider{name: domain.ProviderAnthropic, script: []result{answer(domain.ProviderAnthropic)}}
+	g := newGateway(t, Config{
+		Routes: []domain.Route{fastRoute},
+		Prices: []domain.ModelPrice{
+			{Target: fastRoute.Targets[0], Price: domain.Price{InputPerMTok: 100, OutputPerMTok: 100}},
+			{Target: fastRoute.Targets[1], Price: domain.Price{InputPerMTok: 1, OutputPerMTok: 5}},
+		},
+	}, openai, anthropic)
+
+	// The route falls back, so the cost must use the price of the target
+	// that actually served the request.
+	resp, err := g.Complete(context.Background(), routeRequest("fast"))
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if resp.CostUSD == nil || *resp.CostUSD != 3.5 {
+		t.Errorf("cost = %v, want 3.5 (1 input + 2.5 output at the anthropic price)", resp.CostUSD)
+	}
+	if anthropic.script[0].resp.CostUSD != nil {
+		t.Error("Complete() wrote the cost into the provider's own response")
+	}
+
+	// A model without a price yields no cost rather than a zero.
+	unpriced := routeRequest("claude-opus-5-5")
+	unpriced.Provider = domain.ProviderAnthropic
+	resp, err = g.Complete(context.Background(), unpriced)
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if resp.CostUSD != nil {
+		t.Errorf("cost = %v for an unpriced model, want none", *resp.CostUSD)
+	}
+
+	prices := g.Prices()
+	if len(prices) != 2 || prices[0].Provider != domain.ProviderAnthropic || prices[1].Provider != domain.ProviderOpenAI {
+		t.Errorf("Prices() = %+v, want both, ordered by target", prices)
+	}
+}
+
 func TestNew(t *testing.T) {
 	openai := &fakeProvider{name: domain.ProviderOpenAI}
 	anthropic := &fakeProvider{name: domain.ProviderAnthropic}
@@ -421,6 +466,9 @@ func TestNew(t *testing.T) {
 		{name: "invalid route", providers: []domain.LLMProvider{openai}, cfg: Config{Routes: []domain.Route{{Name: "empty"}}}},
 		{name: "duplicate route", providers: []domain.LLMProvider{openai, anthropic}, cfg: Config{Routes: []domain.Route{fastRoute, fastRoute}}},
 		{name: "route to missing provider", providers: []domain.LLMProvider{openai}, cfg: Config{Routes: []domain.Route{fastRoute}}},
+		{name: "negative price", cfg: Config{Prices: []domain.ModelPrice{{Target: fastRoute.Targets[0], Price: domain.Price{InputPerMTok: -1}}}}},
+		{name: "price without a model", cfg: Config{Prices: []domain.ModelPrice{{Target: domain.Target{Provider: domain.ProviderOpenAI}}}}},
+		{name: "duplicate price", cfg: Config{Prices: []domain.ModelPrice{{Target: fastRoute.Targets[0]}, {Target: fastRoute.Targets[0]}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

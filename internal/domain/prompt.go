@@ -226,6 +226,10 @@ type EvaluationResult struct {
 	// 0 or 1; graded scorers (e.g. LLM-as-judge) may use the full range.
 	Score float64    `json:"score"`
 	Usage TokenUsage `json:"usage"`
+	// CostUSD is the estimated cost of the completion, or nil when no price
+	// was configured for the target that served it. It is fixed when the
+	// result is recorded, so later price changes do not rewrite history.
+	CostUSD *float64 `json:"cost_usd,omitempty"`
 	// Latency is serialised as integer milliseconds under "latency_ms".
 	Latency time.Duration `json:"-"`
 	// Error is non-empty when the test case could not be executed (render
@@ -292,6 +296,12 @@ type RunSummary struct {
 	// Errored counts test cases that could not be executed at all.
 	Errored int        `json:"errored"`
 	Usage   TokenUsage `json:"usage"`
+	// CostUSD is the sum of the results' costs. It understates the run when
+	// Unpriced is not zero.
+	CostUSD float64 `json:"cost_usd"`
+	// Unpriced counts results that consumed tokens but have no cost, because
+	// no price was configured for their target.
+	Unpriced int `json:"unpriced"`
 	// TotalLatencyMS is the sum of the per-result provider latencies.
 	TotalLatencyMS int64 `json:"total_latency_ms"`
 }
@@ -318,6 +328,12 @@ func Summarize(results []EvaluationResult) RunSummary {
 			s.Failed++
 		}
 		s.Usage = s.Usage.Add(r.Usage)
+		switch {
+		case r.CostUSD != nil:
+			s.CostUSD += *r.CostUSD
+		case r.Usage.Total() > 0:
+			s.Unpriced++
+		}
 		s.TotalLatencyMS += r.Latency.Milliseconds()
 	}
 	return s

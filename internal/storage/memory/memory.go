@@ -96,6 +96,14 @@ func cloneTestCase(tc domain.EvaluationTestCase) domain.EvaluationTestCase {
 	return tc
 }
 
+func cloneResult(r domain.EvaluationResult) domain.EvaluationResult {
+	if r.CostUSD != nil {
+		v := *r.CostUSD
+		r.CostUSD = &v
+	}
+	return r
+}
+
 func identity[T any](v T) T { return v }
 
 // CreatePrompt stores a new prompt.
@@ -440,7 +448,9 @@ func (s *Store) SaveResults(_ context.Context, results []domain.EvaluationResult
 	// Report the assigned IDs and timestamps back only once the whole batch
 	// is known to be valid.
 	copy(results, batch)
-	s.results = append(s.results, batch...)
+	for _, r := range batch {
+		s.results = append(s.results, cloneResult(r))
+	}
 	return nil
 }
 
@@ -452,7 +462,7 @@ func (s *Store) ListResultsByRun(_ context.Context, runID string) ([]domain.Eval
 	out := []domain.EvaluationResult{}
 	for _, r := range s.results {
 		if r.RunID == runID {
-			out = append(out, r)
+			out = append(out, cloneResult(r))
 		}
 	}
 	return out, nil
@@ -469,5 +479,5 @@ func (s *Store) ListResultsByVersion(_ context.Context, promptVersionID string, 
 			matching = append(matching, r)
 		}
 	}
-	return page(matching, opts, identity), nil
+	return page(matching, opts, cloneResult), nil
 }

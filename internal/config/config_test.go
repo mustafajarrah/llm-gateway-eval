@@ -40,6 +40,7 @@ func TestFromEnvFull(t *testing.T) {
 		"GATEWAY_EVAL_CONCURRENCY":   "8",
 		"GATEWAY_BREAKER_THRESHOLD":  "10",
 		"GATEWAY_BREAKER_COOLDOWN":   "2m",
+		"GATEWAY_PRICES":             " anthropic:claude-opus-5-5 = 4 / 20 ; ollama:llama3.2:latest=0/0 ;",
 		"GATEWAY_ROUTES":             "fast = ollama:llama3.2:latest , openai:gpt-4o-mini ; smart=anthropic:claude-opus-5-5;",
 		"OPENAI_API_KEY":             "sk-openai",
 		"ANTHROPIC_API_KEY":          "sk-ant",
@@ -92,6 +93,14 @@ func TestFromEnvFull(t *testing.T) {
 	if smart := cfg.Routes[1]; smart.Name != "smart" || smart.Targets[0].Model != "claude-opus-5-5" {
 		t.Errorf("smart route = %+v", smart)
 	}
+
+	wantPrices := []domain.ModelPrice{
+		{Target: domain.Target{Provider: domain.ProviderAnthropic, Model: "claude-opus-5-5"}, Price: domain.Price{InputPerMTok: 4, OutputPerMTok: 20}},
+		{Target: domain.Target{Provider: domain.ProviderOllama, Model: "llama3.2:latest"}},
+	}
+	if len(cfg.Prices) != 2 || cfg.Prices[0] != wantPrices[0] || cfg.Prices[1] != wantPrices[1] {
+		t.Errorf("prices = %+v, want %+v", cfg.Prices, wantPrices)
+	}
 }
 
 func TestFromEnvReportsEveryProblem(t *testing.T) {
@@ -103,6 +112,7 @@ func TestFromEnvReportsEveryProblem(t *testing.T) {
 		"GATEWAY_ATTEMPT_TIMEOUT":   "-5s",
 		"GATEWAY_BREAKER_THRESHOLD": "-1",
 		"GATEWAY_BREAKER_COOLDOWN":  "soon",
+		"GATEWAY_PRICES":            "openai:gpt-4o=cheap/expensive",
 		"GATEWAY_ROUTES":            "fast=cohere:command",
 		"OLLAMA_API_KEY":            "key-without-url",
 		"OPENAI_COMPATIBLE_API_KEY": "key-without-url",
@@ -113,7 +123,7 @@ func TestFromEnvReportsEveryProblem(t *testing.T) {
 	for _, want := range []string{
 		"GATEWAY_ADDR", "GATEWAY_LOG_LEVEL", "GATEWAY_MAX_ATTEMPTS", "GATEWAY_EVAL_CONCURRENCY",
 		"GATEWAY_ATTEMPT_TIMEOUT", "GATEWAY_ROUTES", "OLLAMA_BASE_URL", "OPENAI_COMPATIBLE_BASE_URL",
-		"GATEWAY_BREAKER_THRESHOLD", "GATEWAY_BREAKER_COOLDOWN",
+		"GATEWAY_BREAKER_THRESHOLD", "GATEWAY_BREAKER_COOLDOWN", "GATEWAY_PRICES",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s:\n%v", want, err)
@@ -145,6 +155,25 @@ func TestParseRoutes(t *testing.T) {
 	} {
 		if _, err := ParseRoutes(spec); err == nil {
 			t.Errorf("%s: ParseRoutes(%q) succeeded, want an error", name, spec)
+		}
+	}
+}
+
+func TestParsePrices(t *testing.T) {
+	if prices, err := ParsePrices(" "); err != nil || len(prices) != 0 {
+		t.Errorf("ParsePrices(blank) = %v, %v", prices, err)
+	}
+	for name, spec := range map[string]string{
+		"no equals":        "openai:gpt-4o",
+		"no colon":         "gpt-4o=1/2",
+		"no slash":         "openai:gpt-4o=1",
+		"not numbers":      "openai:gpt-4o=a/b",
+		"negative":         "openai:gpt-4o=-1/2",
+		"unknown provider": "cohere:command=1/2",
+		"empty model":      "openai:=1/2",
+	} {
+		if _, err := ParsePrices(spec); err == nil {
+			t.Errorf("%s: ParsePrices(%q) succeeded, want an error", name, spec)
 		}
 	}
 }
