@@ -32,8 +32,10 @@ type Gateway interface {
 	Complete(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error)
 	Providers() []domain.Provider
 	Routes() []domain.Route
-	// Circuits reports each provider's circuit breaker state.
+	// Circuits and ModelCircuits report the circuit breaker states, per
+	// provider and per "provider:model".
 	Circuits() map[domain.Provider]string
+	ModelCircuits() map[string]string
 	Prices() []domain.ModelPrice
 }
 
@@ -299,6 +301,9 @@ type providersResponse struct {
 	// Circuits maps each provider to "closed", "open" or "half_open". It is
 	// empty when circuit breaking is disabled.
 	Circuits map[domain.Provider]string `json:"circuits"`
+	// ModelCircuits holds the breaker state of each "provider:model" with
+	// recent failures; a model that is absent is closed.
+	ModelCircuits map[string]string `json:"model_circuits"`
 	// Prices are the configured per-model prices, in US dollars per million
 	// tokens.
 	Prices []domain.ModelPrice `json:"prices"`
@@ -306,10 +311,11 @@ type providersResponse struct {
 
 func (a *api) listProviders(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, providersResponse{
-		Providers: a.gateway.Providers(),
-		Routes:    a.gateway.Routes(),
-		Circuits:  a.gateway.Circuits(),
-		Prices:    a.gateway.Prices(),
+		Providers:     a.gateway.Providers(),
+		Routes:        a.gateway.Routes(),
+		Circuits:      a.gateway.Circuits(),
+		ModelCircuits: a.gateway.ModelCircuits(),
+		Prices:        a.gateway.Prices(),
 	})
 }
 

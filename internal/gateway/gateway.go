@@ -43,9 +43,11 @@ type Config struct {
 	// doubles on each further attempt, up to MaxBackoff.
 	BaseBackoff time.Duration
 	MaxBackoff  time.Duration
-	// BreakerThreshold is the number of consecutive unhealthy calls
-	// (timeouts, 429s, 5xx, transport failures) after which a provider's
-	// circuit breaker opens and calls to it fail immediately.
+	// BreakerThreshold is the number of consecutive unhealthy calls after
+	// which a circuit breaker opens and calls fail immediately. There is a
+	// breaker per (provider, model) target, fed by every timeout, 429, 5xx
+	// and transport failure, and one per provider, fed only by failures to
+	// reach the provider at all.
 	BreakerThreshold int
 	// BreakerCooldown is how long an open breaker rejects calls before
 	// letting a single probe through.
@@ -59,9 +61,8 @@ type Config struct {
 // Gateway dispatches requests to providers. It is safe for concurrent use.
 type Gateway struct {
 	providers map[domain.Provider]domain.LLMProvider
-	// breakers has one entry per provider, or none when breaking is
-	// disabled.
-	breakers       map[domain.Provider]*breaker
+	// breakers is nil when circuit breaking is disabled.
+	breakers       *breakerSet
 	routes         map[string]domain.Route
 	prices         map[domain.Target]domain.Price
 	maxAttempts    int
@@ -79,7 +80,6 @@ type Gateway struct {
 func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 	g := &Gateway{
 		providers:      make(map[domain.Provider]domain.LLMProvider, len(providers)),
-		breakers:       make(map[domain.Provider]*breaker, len(providers)),
 		routes:         make(map[string]domain.Route, len(cfg.Routes)),
 		prices:         make(map[domain.Target]domain.Price, len(cfg.Prices)),
 		maxAttempts:    cfg.MaxAttempts,
@@ -126,9 +126,9 @@ func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("%w: provider %s registered twice", domain.ErrInvalidInput, name)
 		}
 		g.providers[name] = p
-		if !cfg.DisableBreaker {
-			g.breakers[name] = &breaker{threshold: threshold, cooldown: cooldown, now: time.Now}
-		}
+	}
+	if !cfg.DisableBreaker {
+		g.breakers = newBreakerSet(threshold, cooldown, time.Now, g.Providers())
 	}
 	for _, route := range cfg.Routes {
 		if err := route.Validate(); err != nil {
@@ -177,14 +177,24 @@ func (g *Gateway) Prices() []domain.ModelPrice {
 	return prices
 }
 
-// Circuits returns the circuit breaker state of every provider: CircuitClosed,
-// CircuitOpen or CircuitHalfOpen. It is empty when breaking is disabled.
+// Circuits returns the state of every provider-level circuit breaker:
+// CircuitClosed, CircuitOpen or CircuitHalfOpen. It is empty when breaking is
+// disabled.
 func (g *Gateway) Circuits() map[domain.Provider]string {
-	states := make(map[domain.Provider]string, len(g.breakers))
-	for name, b := range g.breakers {
-		states[name] = b.state()
+	if g.breakers == nil {
+		return map[domain.Provider]string{}
 	}
-	return states
+	return g.breakers.providerStates()
+}
+
+// ModelCircuits returns the state of the model-level circuit breakers, keyed
+// by "provider:model". Only targets with recent failures are listed; a target
+// that is absent is closed.
+func (g *Gateway) ModelCircuits() map[string]string {
+	if g.breakers == nil {
+		return map[string]string{}
+	}
+	return g.breakers.modelStates()
 }
 
 // Routes returns the configured routes ordered by name.
@@ -206,10 +216,11 @@ func (g *Gateway) Routes() []domain.Route {
 // straight to the next target. Along a route the temperature is clamped to
 // each target's limit.
 //
-// Each provider has a circuit breaker. After enough consecutive unhealthy
-// calls it opens, and until its cooldown passes the provider is skipped
-// without being called, so a route moves on to its next target at once
-// instead of spending retries and backoff on a provider known to be down.
+// Circuit breakers guard each (provider, model) target and each provider.
+// After enough consecutive unhealthy calls a breaker opens, and until its
+// cooldown passes the target is skipped without being called, so a route
+// moves on to its next target at once instead of spending retries and backoff
+// on something known to be failing.
 //
 // A successful response carries an estimated cost when a price is configured
 // for the target that served it.
@@ -283,21 +294,23 @@ func (g *Gateway) resolve(req *domain.LLMRequest) (targets []domain.Target, rout
 }
 
 // tryTarget calls one provider, retrying retryable failures for as long as the
-// provider's circuit breaker allows.
+// circuit breakers allow.
 func (g *Gateway) tryTarget(ctx context.Context, provider domain.LLMProvider, req *domain.LLMRequest) (*domain.LLMResponse, error) {
-	br := g.breakers[req.Provider]
+	target := domain.Target{Provider: req.Provider, Model: req.Model}
 	var lastErr error
 	for attempt := 1; attempt <= g.maxAttempts; attempt++ {
-		if br != nil && !br.allow() {
-			if lastErr == nil {
-				lastErr = &domain.ProviderError{Provider: req.Provider, Retryable: true, Err: ErrCircuitOpen}
+		if g.breakers != nil {
+			if err := g.breakers.allow(target); err != nil {
+				if lastErr == nil {
+					lastErr = &domain.ProviderError{Provider: req.Provider, Retryable: true, Err: err}
+				}
+				g.log.WarnContext(ctx, "target skipped", "provider", req.Provider, "model", req.Model, "reason", err)
+				break
 			}
-			g.log.WarnContext(ctx, "provider skipped: circuit breaker is open", "provider", req.Provider, "model", req.Model)
-			break
 		}
 		resp, err := g.attempt(ctx, provider, req)
-		if br != nil {
-			br.record(classify(ctx, err))
+		if g.breakers != nil {
+			g.breakers.record(ctx, target, err)
 		}
 		if err == nil {
 			return resp, nil
@@ -310,8 +323,8 @@ func (g *Gateway) tryTarget(ctx context.Context, provider domain.LLMProvider, re
 		if ctx.Err() != nil || !domain.IsRetryable(err) || attempt == g.maxAttempts {
 			break
 		}
-		if br != nil && br.state() == CircuitOpen {
-			// This failure opened the breaker; waiting to retry is pointless.
+		if g.breakers != nil && g.breakers.open(target) {
+			// This failure opened a breaker; waiting to retry is pointless.
 			break
 		}
 		if err := g.sleep(ctx, g.backoff(attempt)); err != nil {
@@ -319,22 +332,6 @@ func (g *Gateway) tryTarget(ctx context.Context, provider domain.LLMProvider, re
 		}
 	}
 	return nil, lastErr
-}
-
-// classify turns the result of a provider call into what it says about the
-// provider's health.
-func classify(ctx context.Context, err error) outcome {
-	switch {
-	case err == nil:
-		return outcomeHealthy
-	case ctx.Err() != nil:
-		return outcomeUnknown
-	case domain.IsRetryable(err):
-		return outcomeUnhealthy
-	default:
-		// The provider answered and rejected this particular request.
-		return outcomeHealthy
-	}
 }
 
 // attempt performs a single provider call under the per-attempt timeout.
