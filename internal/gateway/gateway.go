@@ -1,0 +1,253 @@
+// Package gateway routes completion requests to provider adapters, retrying
+// transient failures and falling back along configured routes.
+package gateway
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"sort"
+	"time"
+
+	"github.com/mustafajarrah/llm-gateway-eval/internal/domain"
+)
+
+// Defaults applied by New when the corresponding Config field is zero.
+const (
+	DefaultMaxAttempts    = 2
+	DefaultAttemptTimeout = 60 * time.Second
+	DefaultBaseBackoff    = 250 * time.Millisecond
+	DefaultMaxBackoff     = 5 * time.Second
+)
+
+// Config configures a Gateway.
+type Config struct {
+	// Routes are the named fallback chains. Every target must name a
+	// registered provider.
+	Routes []domain.Route
+	// MaxAttempts is how many times one target is tried before moving on.
+	MaxAttempts int
+	// AttemptTimeout bounds a single call to a provider.
+	AttemptTimeout time.Duration
+	// BaseBackoff is the wait before the second attempt on a target; it
+	// doubles on each further attempt, up to MaxBackoff.
+	BaseBackoff time.Duration
+	MaxBackoff  time.Duration
+	// Logger defaults to slog.Default().
+	Logger *slog.Logger
+}
+
+// Gateway dispatches requests to providers. It is safe for concurrent use.
+type Gateway struct {
+	providers      map[domain.Provider]domain.LLMProvider
+	routes         map[string]domain.Route
+	maxAttempts    int
+	attemptTimeout time.Duration
+	baseBackoff    time.Duration
+	maxBackoff     time.Duration
+	log            *slog.Logger
+
+	// sleep and jitter are replaced in tests.
+	sleep  func(ctx context.Context, d time.Duration) error
+	jitter func() float64
+}
+
+// New builds a Gateway over providers.
+func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
+	g := &Gateway{
+		providers:      make(map[domain.Provider]domain.LLMProvider, len(providers)),
+		routes:         make(map[string]domain.Route, len(cfg.Routes)),
+		maxAttempts:    cfg.MaxAttempts,
+		attemptTimeout: cfg.AttemptTimeout,
+		baseBackoff:    cfg.BaseBackoff,
+		maxBackoff:     cfg.MaxBackoff,
+		log:            cfg.Logger,
+		sleep:          sleep,
+		jitter:         rand.Float64,
+	}
+	if cfg.MaxAttempts < 0 || cfg.AttemptTimeout < 0 || cfg.BaseBackoff < 0 || cfg.MaxBackoff < 0 {
+		return nil, fmt.Errorf("%w: gateway limits must not be negative", domain.ErrInvalidInput)
+	}
+	if g.maxAttempts == 0 {
+		g.maxAttempts = DefaultMaxAttempts
+	}
+	if g.attemptTimeout == 0 {
+		g.attemptTimeout = DefaultAttemptTimeout
+	}
+	if g.baseBackoff == 0 {
+		g.baseBackoff = DefaultBaseBackoff
+	}
+	if g.maxBackoff == 0 {
+		g.maxBackoff = DefaultMaxBackoff
+	}
+	if g.log == nil {
+		g.log = slog.Default()
+	}
+
+	for _, p := range providers {
+		name := p.Name()
+		if !name.Valid() {
+			return nil, fmt.Errorf("%w: unknown provider %q", domain.ErrInvalidInput, name)
+		}
+		if _, dup := g.providers[name]; dup {
+			return nil, fmt.Errorf("%w: provider %s registered twice", domain.ErrInvalidInput, name)
+		}
+		g.providers[name] = p
+	}
+	for _, route := range cfg.Routes {
+		if err := route.Validate(); err != nil {
+			return nil, err
+		}
+		if _, dup := g.routes[route.Name]; dup {
+			return nil, fmt.Errorf("%w: route %q defined twice", domain.ErrInvalidInput, route.Name)
+		}
+		for _, target := range route.Targets {
+			if _, ok := g.providers[target.Provider]; !ok {
+				return nil, fmt.Errorf("%w: route %q uses provider %s, which is not configured",
+					domain.ErrInvalidInput, route.Name, target.Provider)
+			}
+		}
+		g.routes[route.Name] = route
+	}
+	return g, nil
+}
+
+// Providers returns the configured providers in alphabetical order.
+func (g *Gateway) Providers() []domain.Provider {
+	names := make([]domain.Provider, 0, len(g.providers))
+	for name := range g.providers {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
+	return names
+}
+
+// Routes returns the configured routes ordered by name.
+func (g *Gateway) Routes() []domain.Route {
+	routes := make([]domain.Route, 0, len(g.routes))
+	for _, route := range g.routes {
+		routes = append(routes, route)
+	}
+	sort.Slice(routes, func(i, j int) bool { return routes[i].Name < routes[j].Name })
+	return routes
+}
+
+// Complete validates req and sends it to a provider.
+//
+// A request that pins a provider goes to that provider only. Otherwise
+// req.Model names a route, whose targets are tried in order until one
+// succeeds. Each target gets up to MaxAttempts tries, with exponential backoff
+// between them, as long as its failures are retryable; any other failure moves
+// straight to the next target. Along a route the temperature is clamped to
+// each target's limit.
+//
+// When every target fails, the returned error wraps the *domain.ProviderError
+// of each one.
+func (g *Gateway) Complete(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	targets, routed, err := g.resolve(req)
+	if err != nil {
+		return nil, err
+	}
+
+	var failures []error
+	for _, target := range targets {
+		attemptReq := *req
+		attemptReq.Provider = target.Provider
+		attemptReq.Model = target.Model
+		if routed {
+			attemptReq.Parameters = req.Parameters.ClampFor(target.Provider)
+		}
+
+		resp, err := g.tryTarget(ctx, g.providers[target.Provider], &attemptReq)
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			// The caller gave up; do not burn the remaining targets.
+			return nil, fmt.Errorf("%s: %w", target, context.Cause(ctx))
+		}
+		failures = append(failures, fmt.Errorf("%s: %w", target, err))
+	}
+	if !routed {
+		return nil, failures[0]
+	}
+	return nil, fmt.Errorf("route %q: all %d targets failed: %w", req.Model, len(targets), errors.Join(failures...))
+}
+
+// resolve turns a request into the ordered targets to try. routed reports
+// whether they came from a route rather than a pinned provider.
+func (g *Gateway) resolve(req *domain.LLMRequest) (targets []domain.Target, routed bool, err error) {
+	if req.Provider != "" {
+		if _, ok := g.providers[req.Provider]; !ok {
+			return nil, false, fmt.Errorf("%w: provider %s is not configured", domain.ErrInvalidInput, req.Provider)
+		}
+		return []domain.Target{{Provider: req.Provider, Model: req.Model}}, false, nil
+	}
+	route, ok := g.routes[req.Model]
+	if !ok {
+		return nil, false, fmt.Errorf("%w: no route named %q; set provider to address a vendor model directly",
+			domain.ErrInvalidInput, req.Model)
+	}
+	return route.Targets, true, nil
+}
+
+// tryTarget calls one provider, retrying retryable failures.
+func (g *Gateway) tryTarget(ctx context.Context, provider domain.LLMProvider, req *domain.LLMRequest) (*domain.LLMResponse, error) {
+	var lastErr error
+	for attempt := 1; attempt <= g.maxAttempts; attempt++ {
+		resp, err := g.attempt(ctx, provider, req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		g.log.WarnContext(ctx, "provider call failed",
+			"provider", req.Provider, "model", req.Model, "attempt", attempt,
+			"retryable", domain.IsRetryable(err), "error", err)
+
+		if ctx.Err() != nil || !domain.IsRetryable(err) || attempt == g.maxAttempts {
+			break
+		}
+		if err := g.sleep(ctx, g.backoff(attempt)); err != nil {
+			break
+		}
+	}
+	return nil, lastErr
+}
+
+// attempt performs a single provider call under the per-attempt timeout.
+func (g *Gateway) attempt(ctx context.Context, provider domain.LLMProvider, req *domain.LLMRequest) (*domain.LLMResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, g.attemptTimeout)
+	defer cancel()
+	return provider.Complete(ctx, req)
+}
+
+// backoff returns the wait after the given failed attempt (1-based):
+// exponential, capped at maxBackoff, with jitter in [50%, 100%] so that
+// concurrent requests do not retry in lockstep.
+func (g *Gateway) backoff(attempt int) time.Duration {
+	d := g.baseBackoff
+	for i := 1; i < attempt && d < g.maxBackoff; i++ {
+		d *= 2
+	}
+	if d > g.maxBackoff {
+		d = g.maxBackoff
+	}
+	return time.Duration(float64(d) * (0.5 + g.jitter()/2))
+}
+
+// sleep waits for d or until ctx is done.
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
