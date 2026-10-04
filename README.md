@@ -268,7 +268,7 @@ The reasoning behind the main design choices is in [docs/decisions.md](docs/deci
 make check
 ```
 
-That runs `go vet`, the tests with the race detector, and a `gofmt` check: the same steps as CI. `make cover` prints per-package coverage.
+That runs `go vet`, `staticcheck`, the tests with the race detector, and a `gofmt` check: the same steps as CI. `make cover` prints per-package coverage.
 
 No test touches the network or a real provider. Adapters are tested against `httptest` servers that imitate each vendor's API.
 
@@ -282,7 +282,7 @@ Done:
 - [x] SQLite and in-memory storage
 - [x] Evaluation runner and run comparison
 - [x] HTTP API, configuration and service binary
-- [x] CI (gofmt, vet, tests, Docker build)
+- [x] CI (gofmt, vet, staticcheck, tests, Docker build)
 
 Not done yet:
 
@@ -294,7 +294,6 @@ Not done yet:
 - [ ] Asynchronous evaluation runs
 - [ ] Several `openai_compatible` endpoints at once
 - [ ] Metrics and tracing
-- [ ] Linting (golangci-lint)
 
 ## License
 
