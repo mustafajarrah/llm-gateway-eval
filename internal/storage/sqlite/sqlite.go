@@ -534,6 +534,18 @@ func (s *Store) UpdateRun(ctx context.Context, run *domain.EvaluationRun) error 
 	return nil
 }
 
+// InterruptRuns marks every running run as failed.
+func (s *Store) InterruptRuns(ctx context.Context, reason string, at time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET status = ?, error = ?, finished_at = ? WHERE status = ?`,
+		string(domain.RunStatusFailed), reason, toUnix(at), string(domain.RunStatusRunning))
+	if err != nil {
+		return 0, fmt.Errorf("interrupt runs: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 const runColumns = `id, prompt_id, prompt_version_id, version, status, summary, error, started_at, finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (domain.EvaluationRun, error) {

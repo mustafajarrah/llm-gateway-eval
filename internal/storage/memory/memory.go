@@ -368,6 +368,21 @@ func (s *Store) UpdateRun(_ context.Context, run *domain.EvaluationRun) error {
 	return nil
 }
 
+// InterruptRuns marks every running run as failed.
+func (s *Store) InterruptRuns(_ context.Context, reason string, at time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n := 0
+	for i := range s.runs {
+		if run := &s.runs[i]; run.Status == domain.RunStatusRunning {
+			run.Status, run.Error, run.FinishedAt = domain.RunStatusFailed, reason, at
+			n++
+		}
+	}
+	return n, nil
+}
+
 // GetRun returns the run with the given ID.
 func (s *Store) GetRun(_ context.Context, id string) (*domain.EvaluationRun, error) {
 	s.mu.RLock()

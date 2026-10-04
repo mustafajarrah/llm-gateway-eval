@@ -15,6 +15,7 @@ import (
 
 	"github.com/mustafajarrah/llm-gateway-eval/internal/config"
 	"github.com/mustafajarrah/llm-gateway-eval/internal/domain"
+	"github.com/mustafajarrah/llm-gateway-eval/internal/storage/sqlite"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -109,7 +110,7 @@ func TestEndToEnd(t *testing.T) {
 	call(t, h, "POST", base+"/test-cases",
 		`{"name":"lower","variables":{"word":"go"},"expected_output":"go","match_strategy":"exact"}`, http.StatusCreated)
 
-	report := call(t, h, "POST", base+"/runs", "", http.StatusCreated)
+	report := call(t, h, "POST", base+"/runs?wait=true", "", http.StatusCreated)
 	run := report["run"].(map[string]any)
 	summary := run["summary"].(map[string]any)
 	if run["status"] != "completed" || summary["total"] != 2.0 || summary["passed"] != 1.0 || summary["failed"] != 1.0 {
@@ -122,6 +123,74 @@ func TestEndToEnd(t *testing.T) {
 	stored := call(t, h, "GET", "/v1/runs/"+run["id"].(string), "", http.StatusOK)
 	if results := stored["results"].([]any); len(results) != 2 || results[0].(map[string]any)["actual_output"] != "GO" {
 		t.Errorf("stored results = %v", stored["results"])
+	}
+}
+
+// TestBackgroundRunsAcrossRestarts covers the lifecycle of asynchronous runs:
+// Close cancels a run in flight, and a run left "running" in the database by
+// a process that died is marked as failed at the next start.
+func TestBackgroundRunsAcrossRestarts(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	// An upstream that never answers until the client goes away.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The server only notices a client disconnect once the request body
+		// has been read.
+		_, _ = io.Copy(io.Discard, r.Body)
+		entered <- struct{}{}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{
+		Addr:      config.DefaultAddr,
+		DBPath:    filepath.Join(t.TempDir(), "gateway.db"),
+		Providers: []config.Provider{{Name: domain.ProviderOllama, BaseURL: upstream.URL}},
+	}
+	first, err := New(context.Background(), cfg, quiet)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	prompt := call(t, first.Handler, "POST", "/v1/prompts", `{"name":"slow"}`, http.StatusCreated)
+	base := "/v1/prompts/" + prompt["id"].(string)
+	call(t, first.Handler, "POST", base+"/versions", `{"template":"{{.w}}","provider":"ollama","model":"m"}`, http.StatusCreated)
+	call(t, first.Handler, "POST", base+"/test-cases",
+		`{"name":"c","variables":{"w":"x"},"expected_output":"x","match_strategy":"exact"}`, http.StatusCreated)
+
+	started := call(t, first.Handler, "POST", base+"/runs", "", http.StatusAccepted)
+	if started["status"] != "running" {
+		t.Fatalf("started run = %v", started)
+	}
+	<-entered
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// Simulate a crash: put a run back into "running" behind the app's back.
+	store, err := sqlite.Open(context.Background(), cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.GetRun(context.Background(), started["id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != domain.RunStatusFailed || !strings.Contains(cancelled.Error, "run cancelled") {
+		t.Errorf("run after Close = %+v, want it recorded as failed", cancelled)
+	}
+	orphan := &domain.EvaluationRun{PromptID: cancelled.PromptID, PromptVersionID: cancelled.PromptVersionID, Status: domain.RunStatusRunning}
+	if err := store.CreateRun(context.Background(), orphan); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	second, err := New(context.Background(), cfg, quiet)
+	if err != nil {
+		t.Fatalf("New() after restart error = %v", err)
+	}
+	defer second.Close()
+	recovered := call(t, second.Handler, "GET", "/v1/runs/"+orphan.ID, "", http.StatusOK)["run"].(map[string]any)
+	if recovered["status"] != "failed" || !strings.Contains(recovered["error"].(string), "interrupted") {
+		t.Errorf("orphaned run after restart = %v, want it marked as failed", recovered)
 	}
 }
 

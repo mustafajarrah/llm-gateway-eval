@@ -31,6 +31,7 @@ func Run(t *testing.T, newStore func(t *testing.T) Store) {
 		"ConcurrentVersions":  testConcurrentVersions,
 		"TestCases":           testTestCases,
 		"Runs":                testRuns,
+		"InterruptRuns":       testInterruptRuns,
 		"Results":             testResults,
 		"ResultsAreAtomic":    testResultsAreAtomic,
 		"DeletePromptCascade": testDeletePromptCascade,
@@ -451,6 +452,50 @@ func testRuns(t *testing.T, s Store) {
 	wantErr(t, err, domain.ErrNotFound, "GetRun(missing)")
 	_, err = s.ListRuns(ctx, "missing", domain.ListOptions{})
 	wantErr(t, err, domain.ErrNotFound, "ListRuns(missing prompt)")
+}
+
+func testInterruptRuns(t *testing.T, s Store) {
+	if n, err := s.InterruptRuns(ctx, "restart", time.Now()); err != nil || n != 0 {
+		t.Fatalf("InterruptRuns() on an empty store = %d, %v; want 0", n, err)
+	}
+
+	p := mustCreatePrompt(t, s, "summariser")
+	v := mustCreateVersion(t, s, p.ID)
+	stuck := mustCreateRun(t, s, v)
+	alsoStuck := mustCreateRun(t, s, v)
+	done := mustCreateRun(t, s, v)
+	finished := *done
+	finished.Status = domain.RunStatusCompleted
+	finished.Summary = domain.RunSummary{Total: 1, Passed: 1}
+	finished.FinishedAt = done.StartedAt.Add(time.Second)
+	if err := s.UpdateRun(ctx, &finished); err != nil {
+		t.Fatalf("UpdateRun() error = %v", err)
+	}
+
+	at := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+	n, err := s.InterruptRuns(ctx, "interrupted by restart", at)
+	if err != nil || n != 2 {
+		t.Fatalf("InterruptRuns() = %d, %v; want 2", n, err)
+	}
+	for _, id := range []string{stuck.ID, alsoStuck.ID} {
+		got, err := s.GetRun(ctx, id)
+		if err != nil {
+			t.Fatalf("GetRun() error = %v", err)
+		}
+		if got.Status != domain.RunStatusFailed || got.Error != "interrupted by restart" || !got.FinishedAt.Equal(at) {
+			t.Errorf("interrupted run = %+v", got)
+		}
+	}
+	got, err := s.GetRun(ctx, done.ID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if got.Status != domain.RunStatusCompleted || got.Error != "" || got.Summary.Passed != 1 || !got.FinishedAt.Equal(finished.FinishedAt) {
+		t.Errorf("a completed run was touched: %+v", got)
+	}
+	if n, err := s.InterruptRuns(ctx, "again", at); err != nil || n != 0 {
+		t.Errorf("second InterruptRuns() = %d, %v; want 0", n, err)
+	}
 }
 
 func testResults(t *testing.T, s Store) {

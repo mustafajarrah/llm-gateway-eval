@@ -66,6 +66,7 @@ type server struct {
 	handler http.Handler
 	gateway *fakeGateway
 	store   *memory.Store
+	runner  *evaluation.Runner
 	token   string
 }
 
@@ -88,7 +89,7 @@ func newServer(t *testing.T, mutate func(*Config)) *server {
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
-	return &server{t: t, handler: handler, gateway: gateway, store: store, token: cfg.APIKey}
+	return &server{t: t, handler: handler, gateway: gateway, store: store, runner: runner, token: cfg.APIKey}
 }
 
 // do sends a request and decodes the JSON response into out (when non-nil).
@@ -389,6 +390,7 @@ func TestRunsAndComparison(t *testing.T) {
 
 	s.do("POST", base+"/versions", `{"template":"{{.in}}","provider":"openai","model":"gpt-4o"}`, http.StatusCreated, nil)
 	s.wantError("POST", base+"/runs", ``, http.StatusBadRequest, "invalid_input") // no test cases yet
+	s.wantError("POST", base+"/runs?wait=true", ``, http.StatusBadRequest, "invalid_input")
 
 	var pass, flip domain.EvaluationTestCase
 	s.do("POST", base+"/test-cases", `{"name":"pass","variables":{"in":"yes"},"expected_output":"yes","match_strategy":"contains"}`,
@@ -397,7 +399,7 @@ func TestRunsAndComparison(t *testing.T) {
 		http.StatusCreated, &flip)
 
 	var first evaluation.Report
-	rec := s.do("POST", base+"/runs", ``, http.StatusCreated, &first)
+	rec := s.do("POST", base+"/runs?wait=true", ``, http.StatusCreated, &first)
 	if first.Run.Status != domain.RunStatusCompleted || first.Run.Version != 1 || first.Run.Summary.Passed != 2 || len(first.Results) != 2 {
 		t.Errorf("first run = %+v", first)
 	}
@@ -407,7 +409,7 @@ func TestRunsAndComparison(t *testing.T) {
 
 	s.do("POST", base+"/versions", `{"template":"v2 {{.in}}","provider":"openai","model":"gpt-4o"}`, http.StatusCreated, nil)
 	var second evaluation.Report
-	s.do("POST", base+"/runs", `{"version":2}`, http.StatusCreated, &second)
+	s.do("POST", base+"/runs?wait=1", `{"version":2}`, http.StatusCreated, &second)
 	if second.Run.Version != 2 || second.Run.Summary.Passed != 1 || second.Run.Summary.Failed != 1 {
 		t.Errorf("second run = %+v", second.Run)
 	}
@@ -430,6 +432,8 @@ func TestRunsAndComparison(t *testing.T) {
 	}
 
 	s.wantError("POST", base+"/runs", `{"version":9}`, http.StatusNotFound, "not_found")
+	s.wantError("POST", base+"/runs?wait=true", `{"version":9}`, http.StatusNotFound, "not_found")
+	s.wantError("POST", base+"/runs?wait=maybe", ``, http.StatusBadRequest, "invalid_input")
 	s.wantError("POST", base+"/runs", `{"version":-1}`, http.StatusBadRequest, "invalid_input")
 	s.wantError("POST", base+"/runs", `{"version":"two"}`, http.StatusBadRequest, "invalid_input")
 	s.wantError("POST", "/v1/prompts/missing/runs", ``, http.StatusNotFound, "not_found")
@@ -438,6 +442,42 @@ func TestRunsAndComparison(t *testing.T) {
 	s.wantError("GET", "/v1/runs/missing", "", http.StatusNotFound, "not_found")
 	s.wantError("GET", "/v1/comparisons?base="+first.Run.ID, "", http.StatusBadRequest, "invalid_input")
 	s.wantError("GET", "/v1/comparisons?base="+first.Run.ID+"&candidate=missing", "", http.StatusNotFound, "not_found")
+}
+
+func TestRunsAreAsynchronousByDefault(t *testing.T) {
+	s := newServer(t, nil)
+	p := s.createPrompt("echo")
+	base := "/v1/prompts/" + p.ID
+	s.do("POST", base+"/versions", `{"template":"{{.in}}","provider":"openai","model":"gpt-4o"}`, http.StatusCreated, nil)
+	s.do("POST", base+"/test-cases", `{"name":"pass","variables":{"in":"yes"},"expected_output":"yes","match_strategy":"exact"}`,
+		http.StatusCreated, nil)
+
+	var started domain.EvaluationRun
+	rec := s.do("POST", base+"/runs", `{"version":1}`, http.StatusAccepted, &started)
+	if started.ID == "" || started.Status != domain.RunStatusRunning || started.Version != 1 {
+		t.Errorf("accepted run = %+v, want a running run", started)
+	}
+	if got := rec.Header().Get("Location"); got != "/v1/runs/"+started.ID {
+		t.Errorf("Location = %q", got)
+	}
+
+	var report evaluation.Report
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s.do("GET", "/v1/runs/"+started.ID, "", http.StatusOK, &report)
+		if report.Run.Status != domain.RunStatusRunning || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if report.Run.Status != domain.RunStatusCompleted || report.Run.Summary.Passed != 1 || len(report.Results) != 1 {
+		t.Errorf("polled report = %+v, want the completed run", report)
+	}
+
+	if err := s.runner.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.wantError("POST", base+"/runs", ``, http.StatusServiceUnavailable, "unavailable")
 }
 
 func TestUnknownRoutes(t *testing.T) {

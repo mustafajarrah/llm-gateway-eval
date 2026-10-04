@@ -91,11 +91,17 @@ Listings sort by insertion sequence, not by the `created_at` value, so entities 
 
 ## Evaluation
 
-### Runs are synchronous ([#10](https://github.com/mustafajarrah/llm-gateway-eval/pull/10))
+### Runs execute in the background by default
 
-`POST /v1/prompts/{id}/runs` blocks until the run is over. It is the simplest thing that works and needs no job queue, but a large suite ties up the HTTP request, and a client that disconnects cancels the run (which is recorded as `failed`).
+`POST /v1/prompts/{id}/runs` answers `202` with the run in the `running` state and executes the suite in a goroutine of the same process; clients poll `GET /v1/runs/{id}`. `?wait=true` keeps the original blocking behaviour, where a client that disconnects cancels the run.
 
-*To change:* start the run in the background, return `202` with the run ID, and let clients poll `GET /v1/runs/{id}`. The `running` status already exists for this.
+There is no job queue, so the consequences are:
+
+- **A run does not survive the process.** On shutdown, runs in flight are cancelled and recorded as `failed`. After a crash, runs left as `running` are marked `failed` at the next start (`InterruptRuns`). Nothing is resumed.
+- **Results appear only at the end.** They are saved in one transaction when the run finishes, so there is no partial progress to read.
+- **No limit on simultaneous runs.** Each run bounds its own parallelism (`GATEWAY_EVAL_CONCURRENCY`), but nothing caps how many runs execute at once.
+
+*To change:* a persistent queue with workers would make runs durable and cap concurrency.
 
 ### A failing test case never aborts a run ([#10](https://github.com/mustafajarrah/llm-gateway-eval/pull/10))
 
