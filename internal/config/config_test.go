@@ -38,6 +38,8 @@ func TestFromEnvFull(t *testing.T) {
 		"GATEWAY_MAX_ATTEMPTS":       "3",
 		"GATEWAY_ATTEMPT_TIMEOUT":    "45s",
 		"GATEWAY_EVAL_CONCURRENCY":   "8",
+		"GATEWAY_BREAKER_THRESHOLD":  "10",
+		"GATEWAY_BREAKER_COOLDOWN":   "2m",
 		"GATEWAY_ROUTES":             "fast = ollama:llama3.2:latest , openai:gpt-4o-mini ; smart=anthropic:claude-opus-5-5;",
 		"OPENAI_API_KEY":             "sk-openai",
 		"ANTHROPIC_API_KEY":          "sk-ant",
@@ -53,7 +55,8 @@ func TestFromEnvFull(t *testing.T) {
 		t.Fatalf("FromEnv() error = %v", err)
 	}
 	if cfg.Addr != ":9090" || cfg.APIKey != "secret" || cfg.DBPath != ":memory:" || cfg.LogLevel != slog.LevelDebug ||
-		cfg.MaxAttempts != 3 || cfg.AttemptTimeout != 45*time.Second || cfg.EvalConcurrency != 8 || cfg.AnthropicMaxTokens != 2048 {
+		cfg.MaxAttempts != 3 || cfg.AttemptTimeout != 45*time.Second || cfg.EvalConcurrency != 8 || cfg.AnthropicMaxTokens != 2048 ||
+		cfg.BreakerThreshold != 10 || cfg.BreakerCooldown != 2*time.Minute || cfg.BreakerDisabled {
 		t.Errorf("config = %+v", cfg)
 	}
 	if cfg.LoopbackOnly() {
@@ -98,6 +101,8 @@ func TestFromEnvReportsEveryProblem(t *testing.T) {
 		"GATEWAY_MAX_ATTEMPTS":      "0",
 		"GATEWAY_EVAL_CONCURRENCY":  "many",
 		"GATEWAY_ATTEMPT_TIMEOUT":   "-5s",
+		"GATEWAY_BREAKER_THRESHOLD": "-1",
+		"GATEWAY_BREAKER_COOLDOWN":  "soon",
 		"GATEWAY_ROUTES":            "fast=cohere:command",
 		"OLLAMA_API_KEY":            "key-without-url",
 		"OPENAI_COMPATIBLE_API_KEY": "key-without-url",
@@ -108,10 +113,21 @@ func TestFromEnvReportsEveryProblem(t *testing.T) {
 	for _, want := range []string{
 		"GATEWAY_ADDR", "GATEWAY_LOG_LEVEL", "GATEWAY_MAX_ATTEMPTS", "GATEWAY_EVAL_CONCURRENCY",
 		"GATEWAY_ATTEMPT_TIMEOUT", "GATEWAY_ROUTES", "OLLAMA_BASE_URL", "OPENAI_COMPATIBLE_BASE_URL",
+		"GATEWAY_BREAKER_THRESHOLD", "GATEWAY_BREAKER_COOLDOWN",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s:\n%v", want, err)
 		}
+	}
+}
+
+func TestFromEnvDisablesBreaker(t *testing.T) {
+	cfg, err := FromEnv(env(map[string]string{"GATEWAY_BREAKER_THRESHOLD": "0"}))
+	if err != nil {
+		t.Fatalf("FromEnv() error = %v", err)
+	}
+	if !cfg.BreakerDisabled || cfg.BreakerThreshold != 0 {
+		t.Errorf("config = %+v, want the breaker disabled", cfg)
 	}
 }
 

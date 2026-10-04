@@ -53,6 +53,10 @@ func (g *fakeGateway) Providers() []domain.Provider {
 	return []domain.Provider{domain.ProviderAnthropic, domain.ProviderOpenAI}
 }
 
+func (g *fakeGateway) Circuits() map[domain.Provider]string {
+	return map[domain.Provider]string{domain.ProviderAnthropic: "closed", domain.ProviderOpenAI: "open"}
+}
+
 func (g *fakeGateway) Routes() []domain.Route {
 	return []domain.Route{{Name: "fast", Targets: []domain.Target{{Provider: domain.ProviderOpenAI, Model: "gpt-4o-mini"}}}}
 }
@@ -177,7 +181,8 @@ func TestProviders(t *testing.T) {
 	var resp providersResponse
 	s.do("GET", "/v1/providers", "", http.StatusOK, &resp)
 	if len(resp.Providers) != 2 || resp.Providers[0] != domain.ProviderAnthropic ||
-		len(resp.Routes) != 1 || resp.Routes[0].Name != "fast" || resp.Routes[0].Targets[0].Model != "gpt-4o-mini" {
+		len(resp.Routes) != 1 || resp.Routes[0].Name != "fast" || resp.Routes[0].Targets[0].Model != "gpt-4o-mini" ||
+		resp.Circuits[domain.ProviderOpenAI] != "open" || resp.Circuits[domain.ProviderAnthropic] != "closed" {
 		t.Errorf("response = %+v", resp)
 	}
 }

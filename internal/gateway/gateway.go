@@ -20,6 +20,11 @@ const (
 	DefaultAttemptTimeout = 60 * time.Second
 	DefaultBaseBackoff    = 250 * time.Millisecond
 	DefaultMaxBackoff     = 5 * time.Second
+	// DefaultBreakerThreshold is how many consecutive unhealthy calls open a
+	// provider's circuit breaker, and DefaultBreakerCooldown how long it then
+	// stays open before a probe is let through.
+	DefaultBreakerThreshold = 5
+	DefaultBreakerCooldown  = 30 * time.Second
 )
 
 // Config configures a Gateway.
@@ -35,13 +40,25 @@ type Config struct {
 	// doubles on each further attempt, up to MaxBackoff.
 	BaseBackoff time.Duration
 	MaxBackoff  time.Duration
+	// BreakerThreshold is the number of consecutive unhealthy calls
+	// (timeouts, 429s, 5xx, transport failures) after which a provider's
+	// circuit breaker opens and calls to it fail immediately.
+	BreakerThreshold int
+	// BreakerCooldown is how long an open breaker rejects calls before
+	// letting a single probe through.
+	BreakerCooldown time.Duration
+	// DisableBreaker turns circuit breaking off.
+	DisableBreaker bool
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 }
 
 // Gateway dispatches requests to providers. It is safe for concurrent use.
 type Gateway struct {
-	providers      map[domain.Provider]domain.LLMProvider
+	providers map[domain.Provider]domain.LLMProvider
+	// breakers has one entry per provider, or none when breaking is
+	// disabled.
+	breakers       map[domain.Provider]*breaker
 	routes         map[string]domain.Route
 	maxAttempts    int
 	attemptTimeout time.Duration
@@ -58,6 +75,7 @@ type Gateway struct {
 func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 	g := &Gateway{
 		providers:      make(map[domain.Provider]domain.LLMProvider, len(providers)),
+		breakers:       make(map[domain.Provider]*breaker, len(providers)),
 		routes:         make(map[string]domain.Route, len(cfg.Routes)),
 		maxAttempts:    cfg.MaxAttempts,
 		attemptTimeout: cfg.AttemptTimeout,
@@ -67,7 +85,8 @@ func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 		sleep:          sleep,
 		jitter:         rand.Float64,
 	}
-	if cfg.MaxAttempts < 0 || cfg.AttemptTimeout < 0 || cfg.BaseBackoff < 0 || cfg.MaxBackoff < 0 {
+	if cfg.MaxAttempts < 0 || cfg.AttemptTimeout < 0 || cfg.BaseBackoff < 0 || cfg.MaxBackoff < 0 ||
+		cfg.BreakerThreshold < 0 || cfg.BreakerCooldown < 0 {
 		return nil, fmt.Errorf("%w: gateway limits must not be negative", domain.ErrInvalidInput)
 	}
 	if g.maxAttempts == 0 {
@@ -85,6 +104,13 @@ func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 	if g.log == nil {
 		g.log = slog.Default()
 	}
+	threshold, cooldown := cfg.BreakerThreshold, cfg.BreakerCooldown
+	if threshold == 0 {
+		threshold = DefaultBreakerThreshold
+	}
+	if cooldown == 0 {
+		cooldown = DefaultBreakerCooldown
+	}
 
 	for _, p := range providers {
 		name := p.Name()
@@ -95,6 +121,9 @@ func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("%w: provider %s registered twice", domain.ErrInvalidInput, name)
 		}
 		g.providers[name] = p
+		if !cfg.DisableBreaker {
+			g.breakers[name] = &breaker{threshold: threshold, cooldown: cooldown, now: time.Now}
+		}
 	}
 	for _, route := range cfg.Routes {
 		if err := route.Validate(); err != nil {
@@ -124,6 +153,16 @@ func (g *Gateway) Providers() []domain.Provider {
 	return names
 }
 
+// Circuits returns the circuit breaker state of every provider: CircuitClosed,
+// CircuitOpen or CircuitHalfOpen. It is empty when breaking is disabled.
+func (g *Gateway) Circuits() map[domain.Provider]string {
+	states := make(map[domain.Provider]string, len(g.breakers))
+	for name, b := range g.breakers {
+		states[name] = b.state()
+	}
+	return states
+}
+
 // Routes returns the configured routes ordered by name.
 func (g *Gateway) Routes() []domain.Route {
 	routes := make([]domain.Route, 0, len(g.routes))
@@ -142,6 +181,11 @@ func (g *Gateway) Routes() []domain.Route {
 // between them, as long as its failures are retryable; any other failure moves
 // straight to the next target. Along a route the temperature is clamped to
 // each target's limit.
+//
+// Each provider has a circuit breaker. After enough consecutive unhealthy
+// calls it opens, and until its cooldown passes the provider is skipped
+// without being called, so a route moves on to its next target at once
+// instead of spending retries and backoff on a provider known to be down.
 //
 // When every target fails, the returned error wraps the *domain.ProviderError
 // of each one.
@@ -196,11 +240,23 @@ func (g *Gateway) resolve(req *domain.LLMRequest) (targets []domain.Target, rout
 	return route.Targets, true, nil
 }
 
-// tryTarget calls one provider, retrying retryable failures.
+// tryTarget calls one provider, retrying retryable failures for as long as the
+// provider's circuit breaker allows.
 func (g *Gateway) tryTarget(ctx context.Context, provider domain.LLMProvider, req *domain.LLMRequest) (*domain.LLMResponse, error) {
+	br := g.breakers[req.Provider]
 	var lastErr error
 	for attempt := 1; attempt <= g.maxAttempts; attempt++ {
+		if br != nil && !br.allow() {
+			if lastErr == nil {
+				lastErr = &domain.ProviderError{Provider: req.Provider, Retryable: true, Err: ErrCircuitOpen}
+			}
+			g.log.WarnContext(ctx, "provider skipped: circuit breaker is open", "provider", req.Provider, "model", req.Model)
+			break
+		}
 		resp, err := g.attempt(ctx, provider, req)
+		if br != nil {
+			br.record(classify(ctx, err))
+		}
 		if err == nil {
 			return resp, nil
 		}
@@ -212,11 +268,31 @@ func (g *Gateway) tryTarget(ctx context.Context, provider domain.LLMProvider, re
 		if ctx.Err() != nil || !domain.IsRetryable(err) || attempt == g.maxAttempts {
 			break
 		}
+		if br != nil && br.state() == CircuitOpen {
+			// This failure opened the breaker; waiting to retry is pointless.
+			break
+		}
 		if err := g.sleep(ctx, g.backoff(attempt)); err != nil {
 			break
 		}
 	}
 	return nil, lastErr
+}
+
+// classify turns the result of a provider call into what it says about the
+// provider's health.
+func classify(ctx context.Context, err error) outcome {
+	switch {
+	case err == nil:
+		return outcomeHealthy
+	case ctx.Err() != nil:
+		return outcomeUnknown
+	case domain.IsRetryable(err):
+		return outcomeUnhealthy
+	default:
+		// The provider answered and rejected this particular request.
+		return outcomeHealthy
+	}
 }
 
 // attempt performs a single provider call under the per-attempt timeout.

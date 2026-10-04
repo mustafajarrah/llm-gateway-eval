@@ -43,10 +43,13 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*App, er
 		return nil, err
 	}
 	gw, err := gateway.New(providers, gateway.Config{
-		Routes:         cfg.Routes,
-		MaxAttempts:    cfg.MaxAttempts,
-		AttemptTimeout: cfg.AttemptTimeout,
-		Logger:         logger,
+		Routes:           cfg.Routes,
+		MaxAttempts:      cfg.MaxAttempts,
+		AttemptTimeout:   cfg.AttemptTimeout,
+		BreakerThreshold: cfg.BreakerThreshold,
+		BreakerCooldown:  cfg.BreakerCooldown,
+		DisableBreaker:   cfg.BreakerDisabled,
+		Logger:           logger,
 	})
 	if err != nil {
 		return nil, err

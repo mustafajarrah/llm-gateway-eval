@@ -61,6 +61,14 @@ A rejected key or unknown model is specific to one provider, so the next target 
 
 Attempts and timeout are configurable through the environment; the backoff bounds are not yet.
 
+### A hand-written circuit breaker per provider
+
+After 5 consecutive unhealthy calls a provider is skipped for 30 seconds, then probed with a single request. Only failures that say something about the provider's health count (timeouts, 429s, 5xx, transport errors); a 4xx or a caller that gave up does not.
+
+It is about a hundred lines in `internal/gateway/breaker.go` rather than a library such as `sony/gobreaker`, to keep the dependency count at two. It is keyed by provider, not by model, so one failing model can open the breaker for the vendor's other models. State is in memory and per process: several instances each learn about an outage on their own.
+
+*To change:* `GATEWAY_BREAKER_THRESHOLD` (0 disables) and `GATEWAY_BREAKER_COOLDOWN`.
+
 ## Storage
 
 ### SQLite through a pure-Go driver ([#9](https://github.com/mustafajarrah/llm-gateway-eval/pull/9))

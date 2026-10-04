@@ -32,6 +32,8 @@ type Gateway interface {
 	Complete(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error)
 	Providers() []domain.Provider
 	Routes() []domain.Route
+	// Circuits reports each provider's circuit breaker state.
+	Circuits() map[domain.Provider]string
 }
 
 // Evaluator runs and compares evaluation runs.
@@ -290,10 +292,17 @@ func listOptions(r *http.Request) (domain.ListOptions, error) {
 type providersResponse struct {
 	Providers []domain.Provider `json:"providers"`
 	Routes    []domain.Route    `json:"routes"`
+	// Circuits maps each provider to "closed", "open" or "half_open". It is
+	// empty when circuit breaking is disabled.
+	Circuits map[domain.Provider]string `json:"circuits"`
 }
 
 func (a *api) listProviders(w http.ResponseWriter, _ *http.Request) {
-	a.writeJSON(w, http.StatusOK, providersResponse{Providers: a.gateway.Providers(), Routes: a.gateway.Routes()})
+	a.writeJSON(w, http.StatusOK, providersResponse{
+		Providers: a.gateway.Providers(),
+		Routes:    a.gateway.Routes(),
+		Circuits:  a.gateway.Circuits(),
+	})
 }
 
 func (a *api) complete(w http.ResponseWriter, r *http.Request) {

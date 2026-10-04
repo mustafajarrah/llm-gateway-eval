@@ -290,6 +290,100 @@ func TestCompleteRejectsBadRequests(t *testing.T) {
 	}
 }
 
+func TestCircuitBreakerSkipsFailingProvider(t *testing.T) {
+	openai := &fakeProvider{name: domain.ProviderOpenAI, script: []result{fail(domain.ProviderOpenAI, 503, true)}}
+	anthropic := &fakeProvider{name: domain.ProviderAnthropic, script: []result{ok(domain.ProviderAnthropic)}}
+	g := newGateway(t, Config{Routes: []domain.Route{fastRoute}, BreakerThreshold: 3, BreakerCooldown: time.Minute}, openai, anthropic)
+	now := time.Unix(1000, 0)
+	g.breakers[domain.ProviderOpenAI].now = func() time.Time { return now }
+
+	// Request 1 spends both attempts on openai (2 failures); request 2 fails
+	// once more, which opens the breaker and cuts its retries short.
+	for i := range 2 {
+		resp, err := g.Complete(context.Background(), routeRequest("fast"))
+		if err != nil || resp.Provider != domain.ProviderAnthropic {
+			t.Fatalf("request %d: resp %+v, err %v; want the anthropic fallback", i+1, resp, err)
+		}
+	}
+	if len(openai.calls) != 3 {
+		t.Fatalf("openai called %d times, want 3 (the breaker opens on the third failure)", len(openai.calls))
+	}
+	if len(g.sleeps) != 1 {
+		t.Errorf("%d backoffs, want 1: no backoff after the failure that opens the breaker", len(g.sleeps))
+	}
+	if got := g.Circuits(); got[domain.ProviderOpenAI] != CircuitOpen || got[domain.ProviderAnthropic] != CircuitClosed {
+		t.Errorf("Circuits() = %v", got)
+	}
+
+	// While open, openai is not called at all and no backoff is spent on it.
+	sleeps := len(g.sleeps)
+	for range 3 {
+		if _, err := g.Complete(context.Background(), routeRequest("fast")); err != nil {
+			t.Fatalf("Complete() error = %v", err)
+		}
+	}
+	if len(openai.calls) != 3 || len(g.sleeps) != sleeps {
+		t.Errorf("openai calls %d, new backoffs %d; an open breaker must skip the provider entirely",
+			len(openai.calls), len(g.sleeps)-sleeps)
+	}
+
+	// A pinned request to the broken provider fails fast with a clear cause.
+	pinned := routeRequest("gpt-4o")
+	pinned.Provider = domain.ProviderOpenAI
+	_, err := g.Complete(context.Background(), pinned)
+	var pe *domain.ProviderError
+	if !errors.Is(err, ErrCircuitOpen) || !errors.As(err, &pe) || pe.Provider != domain.ProviderOpenAI {
+		t.Errorf("pinned request error = %v, want a ProviderError wrapping ErrCircuitOpen", err)
+	}
+	if len(openai.calls) != 3 {
+		t.Errorf("openai called for a pinned request while its breaker was open")
+	}
+
+	// After the cooldown one probe goes through; the provider has recovered.
+	now = now.Add(time.Minute)
+	openai.script = []result{ok(domain.ProviderOpenAI)}
+	openai.calls = nil
+	resp, err := g.Complete(context.Background(), routeRequest("fast"))
+	if err != nil || resp.Provider != domain.ProviderOpenAI {
+		t.Fatalf("after the cooldown: resp %+v, err %v; want openai again", resp, err)
+	}
+	if got := g.Circuits()[domain.ProviderOpenAI]; got != CircuitClosed {
+		t.Errorf("circuit = %s after a healthy probe, want closed", got)
+	}
+}
+
+func TestCircuitBreakerIgnoresRejectedRequests(t *testing.T) {
+	openai := &fakeProvider{name: domain.ProviderOpenAI, script: []result{fail(domain.ProviderOpenAI, 400, false)}}
+	g := newGateway(t, Config{BreakerThreshold: 2}, openai)
+
+	req := routeRequest("gpt-4o")
+	req.Provider = domain.ProviderOpenAI
+	for range 5 {
+		_, _ = g.Complete(context.Background(), req)
+	}
+	if len(openai.calls) != 5 || g.Circuits()[domain.ProviderOpenAI] != CircuitClosed {
+		t.Errorf("calls %d, circuit %s; 4xx answers must not open the breaker",
+			len(openai.calls), g.Circuits()[domain.ProviderOpenAI])
+	}
+}
+
+func TestCircuitBreakerDisabled(t *testing.T) {
+	openai := &fakeProvider{name: domain.ProviderOpenAI, script: []result{fail(domain.ProviderOpenAI, 503, true)}}
+	g := newGateway(t, Config{BreakerThreshold: 1, DisableBreaker: true}, openai)
+
+	req := routeRequest("gpt-4o")
+	req.Provider = domain.ProviderOpenAI
+	for range 3 {
+		_, _ = g.Complete(context.Background(), req)
+	}
+	if len(openai.calls) != 6 {
+		t.Errorf("openai called %d times, want all 6 attempts with the breaker disabled", len(openai.calls))
+	}
+	if got := g.Circuits(); len(got) != 0 {
+		t.Errorf("Circuits() = %v, want none when disabled", got)
+	}
+}
+
 func TestNew(t *testing.T) {
 	openai := &fakeProvider{name: domain.ProviderOpenAI}
 	anthropic := &fakeProvider{name: domain.ProviderAnthropic}
@@ -305,6 +399,9 @@ func TestNew(t *testing.T) {
 		g.baseBackoff != DefaultBaseBackoff || g.maxBackoff != DefaultMaxBackoff || g.log == nil {
 		t.Errorf("defaults not applied: %+v", g)
 	}
+	if b := g.breakers[domain.ProviderOpenAI]; b == nil || b.threshold != DefaultBreakerThreshold || b.cooldown != DefaultBreakerCooldown {
+		t.Errorf("breaker defaults not applied: %+v", b)
+	}
 	if got := g.Providers(); len(got) != 2 || got[0] != domain.ProviderAnthropic || got[1] != domain.ProviderOpenAI {
 		t.Errorf("Providers() = %v, want alphabetical order", got)
 	}
@@ -318,6 +415,7 @@ func TestNew(t *testing.T) {
 		cfg       Config
 	}{
 		{name: "negative limit", cfg: Config{MaxAttempts: -1}},
+		{name: "negative breaker threshold", cfg: Config{BreakerThreshold: -1}},
 		{name: "unknown provider", providers: []domain.LLMProvider{&fakeProvider{name: "cohere"}}},
 		{name: "duplicate provider", providers: []domain.LLMProvider{openai, openai}},
 		{name: "invalid route", providers: []domain.LLMProvider{openai}, cfg: Config{Routes: []domain.Route{{Name: "empty"}}}},
