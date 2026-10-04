@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -137,23 +138,127 @@ func TestBreakerIgnoresUnknownOutcomes(t *testing.T) {
 func TestClassify(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	retryable := &domain.ProviderError{Retryable: true, Err: errors.New("503")}
-	rejected := &domain.ProviderError{StatusCode: 400, Err: errors.New("bad request")}
+	live := context.Background()
 
 	tests := []struct {
-		name string
-		ctx  context.Context
-		err  error
-		want outcome
+		name         string
+		ctx          context.Context
+		err          error
+		model, whole outcome
 	}{
-		{name: "success", ctx: context.Background(), want: outcomeHealthy},
-		{name: "retryable failure", ctx: context.Background(), err: retryable, want: outcomeUnhealthy},
-		{name: "request rejected", ctx: context.Background(), err: rejected, want: outcomeHealthy},
-		{name: "caller gave up", ctx: cancelled, err: retryable, want: outcomeUnknown},
+		{name: "success", ctx: live, model: outcomeHealthy, whole: outcomeHealthy},
+		{name: "rate limited", ctx: live, model: outcomeUnhealthy, whole: outcomeHealthy,
+			err: &domain.ProviderError{StatusCode: 429, Retryable: true, Err: errors.New("slow down")}},
+		{name: "server error", ctx: live, model: outcomeUnhealthy, whole: outcomeHealthy,
+			err: &domain.ProviderError{StatusCode: 503, Retryable: true, Err: errors.New("overloaded")}},
+		{name: "attempt timed out", ctx: live, model: outcomeUnhealthy, whole: outcomeUnknown,
+			err: &domain.ProviderError{Retryable: true, Err: context.DeadlineExceeded}},
+		{name: "connection refused", ctx: live, model: outcomeUnhealthy, whole: outcomeUnhealthy,
+			err: fmt.Errorf("wrapped: %w", &domain.ProviderError{Retryable: true, Err: errors.New("connection refused")})},
+		{name: "request rejected", ctx: live, model: outcomeHealthy, whole: outcomeHealthy,
+			err: &domain.ProviderError{StatusCode: 400, Err: errors.New("bad request")}},
+		{name: "not a provider error", ctx: live, model: outcomeHealthy, whole: outcomeHealthy,
+			err: errors.New("unexpected")},
+		{name: "caller gave up", ctx: cancelled, model: outcomeUnknown, whole: outcomeUnknown,
+			err: &domain.ProviderError{Retryable: true, Err: errors.New("connection refused")}},
 	}
 	for _, tt := range tests {
-		if got := classify(tt.ctx, tt.err); got != tt.want {
-			t.Errorf("%s: classify() = %v, want %v", tt.name, got, tt.want)
+		model, whole := classify(tt.ctx, tt.err)
+		if model != tt.model || whole != tt.whole {
+			t.Errorf("%s: classify() = (%v, %v), want (%v, %v)", tt.name, model, whole, tt.model, tt.whole)
 		}
+	}
+}
+
+func TestBreakerSetModelBreakersAreTransient(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	s := newBreakerSet(2, time.Minute, c.now, []domain.Provider{domain.ProviderOpenAI})
+	target := domain.Target{Provider: domain.ProviderOpenAI, Model: "gpt-4o"}
+	live := context.Background()
+	overloaded := &domain.ProviderError{StatusCode: 503, Retryable: true, Err: errors.New("overloaded")}
+
+	// A healthy model never gets an entry.
+	if err := s.allow(target); err != nil {
+		t.Fatalf("allow() error = %v", err)
+	}
+	s.record(live, target, nil)
+	if got := s.modelStates(); len(got) != 0 {
+		t.Errorf("modelStates() = %v after a healthy call, want none", got)
+	}
+
+	// One failure creates it; the next healthy call drops it again.
+	s.allow(target)
+	s.record(live, target, overloaded)
+	if got := s.modelStates(); got["openai:gpt-4o"] != CircuitClosed {
+		t.Errorf("modelStates() = %v, want a closed breaker with one failure", got)
+	}
+	s.allow(target)
+	s.record(live, target, nil)
+	if got := s.modelStates(); len(got) != 0 {
+		t.Errorf("modelStates() = %v after recovery, want none", got)
+	}
+}
+
+func TestBreakerSetIsBounded(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	s := newBreakerSet(1, time.Minute, c.now, []domain.Provider{domain.ProviderOpenAI})
+	live := context.Background()
+	overloaded := &domain.ProviderError{StatusCode: 503, Retryable: true, Err: errors.New("overloaded")}
+
+	for i := range maxModelBreakers + 50 {
+		target := domain.Target{Provider: domain.ProviderOpenAI, Model: fmt.Sprintf("made-up-%d", i)}
+		if err := s.allow(target); err != nil {
+			t.Fatalf("allow(%s) error = %v", target, err)
+		}
+		s.record(live, target, overloaded)
+	}
+	if got := len(s.modelStates()); got != maxModelBreakers {
+		t.Errorf("%d model breakers, want the cap of %d", got, maxModelBreakers)
+	}
+	// Past the cap a model has no breaker of its own and stays callable.
+	beyond := domain.Target{Provider: domain.ProviderOpenAI, Model: fmt.Sprintf("made-up-%d", maxModelBreakers+10)}
+	if err := s.allow(beyond); err != nil {
+		t.Errorf("allow() past the cap error = %v", err)
+	}
+	s.record(live, beyond, nil)
+}
+
+func TestBreakerSetReleasesModelProbeWhenProviderIsOpen(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	s := newBreakerSet(1, time.Minute, c.now, []domain.Provider{domain.ProviderOpenAI})
+	target := domain.Target{Provider: domain.ProviderOpenAI, Model: "gpt-4o"}
+	live := context.Background()
+	refused := &domain.ProviderError{Retryable: true, Err: errors.New("connection refused")}
+
+	// A connection failure opens both levels.
+	s.allow(target)
+	s.record(live, target, refused)
+	if !s.open(target) || s.providerStates()[domain.ProviderOpenAI] != CircuitOpen || s.modelStates()["openai:gpt-4o"] != CircuitOpen {
+		t.Fatalf("after a connection failure: provider %v, models %v", s.providerStates(), s.modelStates())
+	}
+
+	// Make only the model breaker eligible for a probe by reopening the
+	// provider's later.
+	c.advance(30 * time.Second)
+	other := domain.Target{Provider: domain.ProviderOpenAI, Model: "gpt-4o-mini"}
+	s.providers[domain.ProviderOpenAI].openedAt = c.now()
+	c.advance(30 * time.Second)
+
+	err := s.allow(target)
+	if !errors.Is(err, ErrCircuitOpen) || err.Error() != "circuit breaker is open for provider openai" {
+		t.Fatalf("allow() error = %v, want the provider breaker to reject", err)
+	}
+	if got := s.modelStates()["openai:gpt-4o"]; got != CircuitHalfOpen {
+		t.Errorf("model breaker = %s, want half_open", got)
+	}
+	// The model's probe slot was handed back, so once the provider recovers
+	// the model can be probed.
+	c.advance(30 * time.Second)
+	if err := s.allow(target); err != nil {
+		t.Errorf("allow() after the provider cooldown error = %v, want the probe to go through", err)
+	}
+	s.record(live, target, nil)
+	if s.open(target) || s.open(other) {
+		t.Error("breakers still open after a healthy probe")
 	}
 }

@@ -57,6 +57,10 @@ func (g *fakeGateway) Circuits() map[domain.Provider]string {
 	return map[domain.Provider]string{domain.ProviderAnthropic: "closed", domain.ProviderOpenAI: "open"}
 }
 
+func (g *fakeGateway) ModelCircuits() map[string]string {
+	return map[string]string{"openai:gpt-4o": "half_open"}
+}
+
 func (g *fakeGateway) Prices() []domain.ModelPrice {
 	return []domain.ModelPrice{{
 		Target: domain.Target{Provider: domain.ProviderOpenAI, Model: "gpt-4o"},
@@ -191,6 +195,7 @@ func TestProviders(t *testing.T) {
 	if len(resp.Providers) != 2 || resp.Providers[0] != domain.ProviderAnthropic ||
 		len(resp.Routes) != 1 || resp.Routes[0].Name != "fast" || resp.Routes[0].Targets[0].Model != "gpt-4o-mini" ||
 		resp.Circuits[domain.ProviderOpenAI] != "open" || resp.Circuits[domain.ProviderAnthropic] != "closed" ||
+		resp.ModelCircuits["openai:gpt-4o"] != "half_open" ||
 		len(resp.Prices) != 1 || resp.Prices[0].Model != "gpt-4o" || resp.Prices[0].OutputPerMTok != 10 {
 		t.Errorf("response = %+v", resp)
 	}

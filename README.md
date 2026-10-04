@@ -85,15 +85,24 @@ The gateway tries each target in order:
 
 The response says which provider and model served the request.
 
-### Circuit breaker
+### Circuit breakers
 
-Each provider has a circuit breaker, so a provider that is down stops costing every request its retries and backoff.
+Circuit breakers stop a failing target from costing every request its retries and backoff. There are two levels, and a call goes through only when both allow it.
 
-- After 5 consecutive unhealthy calls (timeouts, 429s, 5xx, connection failures) the breaker **opens**: for 30 seconds the provider is skipped without being called. A route moves straight to its next target; a pinned request fails at once with a 502 whose message says the circuit breaker is open.
+| Breaker | Counts | Why |
+| --- | --- | --- |
+| Per model (`provider:model`) | Every unhealthy call: timeouts, 429s, 5xx, connection failures | Rate limits and overload usually hit one model while the vendor's other models keep answering |
+| Per provider | Only failures to reach the provider at all: connection refused, DNS, reset | Those mean the vendor is unreachable whatever the model |
+
+So five 429s on one model stop traffic to that model only, while a vendor that cannot be reached is skipped for all of its models after five failed connections, instead of five per model.
+
+Both levels work the same way:
+
+- After 5 consecutive unhealthy calls the breaker **opens**: for 30 seconds the target is skipped without being called. A route moves straight to its next target; a pinned request fails at once with a 502 whose message says which breaker is open.
 - After the cooldown the breaker is **half-open**: one probe request goes through. If it succeeds the breaker closes; if not, it reopens for another cooldown.
-- A 4xx answer does not count against the provider, since it means the provider is up and rejected that request.
+- A 4xx answer does not count, since it means the provider is up and rejected that request. A timeout counts against the model but not the provider.
 
-`GET /v1/providers` reports each provider's state under `circuits` (`closed`, `open` or `half_open`). The state is kept in memory, per process.
+`GET /v1/providers` reports the provider breakers under `circuits` and the model breakers under `model_circuits` (`closed`, `open` or `half_open`). Only models with recent failures are listed; a model that is absent is closed. The state is kept in memory, per process.
 
 ## Cost
 
@@ -235,8 +244,8 @@ Everything is configured through environment variables; [.env.example](.env.exam
 | `GATEWAY_ROUTES` | none | Fallback chains, see [Routing](#routing) |
 | `GATEWAY_MAX_ATTEMPTS` | `2` | Tries per target |
 | `GATEWAY_ATTEMPT_TIMEOUT` | `60s` | Limit of a single provider call |
-| `GATEWAY_BREAKER_THRESHOLD` | `5` | Consecutive unhealthy calls that open a provider's circuit breaker; `0` disables it |
-| `GATEWAY_BREAKER_COOLDOWN` | `30s` | How long an open breaker skips the provider |
+| `GATEWAY_BREAKER_THRESHOLD` | `5` | Consecutive unhealthy calls that open a circuit breaker; `0` disables them |
+| `GATEWAY_BREAKER_COOLDOWN` | `30s` | How long an open breaker skips its target |
 | `GATEWAY_PRICES` | none | Per-model prices, see [Cost](#cost) |
 | `GATEWAY_EVAL_CONCURRENCY` | `4` | Test cases evaluated in parallel |
 | `ANTHROPIC_MAX_TOKENS` | `16000` | Output limit for Anthropic requests that set none |

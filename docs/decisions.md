@@ -61,11 +61,18 @@ A rejected key or unknown model is specific to one provider, so the next target 
 
 Attempts and timeout are configurable through the environment; the backoff bounds are not yet.
 
-### A hand-written circuit breaker per provider
+### Hand-written circuit breakers, per model and per provider
 
-After 5 consecutive unhealthy calls a provider is skipped for 30 seconds, then probed with a single request. Only failures that say something about the provider's health count (timeouts, 429s, 5xx, transport errors); a 4xx or a caller that gave up does not.
+A breaker opens after 5 consecutive unhealthy calls, skips its target for 30 seconds, then lets a single probe through.
 
-It is about a hundred lines in `internal/gateway/breaker.go` rather than a library such as `sony/gobreaker`, to keep the dependency count at two. It is keyed by provider, not by model, so one failing model can open the breaker for the vendor's other models. State is in memory and per process: several instances each learn about an outage on their own.
+- **Per model**, fed by every unhealthy call (timeouts, 429s, 5xx, connection failures). Rate limits and overload are usually specific to a model, so one failing model must not block the vendor's others. This matters most for a route such as `anthropic:opus,anthropic:haiku`, where the second target exists to cover the first.
+- **Per provider**, fed only by failures to reach the provider at all. Without it, every model would have to discover a vendor-wide outage on its own.
+- **Timeouts count against the model only.** A timeout arrives without an HTTP status, like a connection failure, but it usually means a slow model rather than an unreachable vendor.
+- **4xx answers and abandoned calls count against nothing.**
+
+Model breakers exist only for targets with recent failures and are capped at 1024, because model names come from requests and an unbounded map would be a way to exhaust memory. Past the cap a model is covered by its provider's breaker only.
+
+Both levels share one threshold and one cooldown. The implementation is `internal/gateway/breaker.go` rather than a library such as `sony/gobreaker`, to keep the dependency count at two. State is in memory and per process: several instances each learn about an outage on their own.
 
 *To change:* `GATEWAY_BREAKER_THRESHOLD` (0 disables) and `GATEWAY_BREAKER_COOLDOWN`.
 
