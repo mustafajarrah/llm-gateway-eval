@@ -138,7 +138,8 @@ internal/
 - [ ] Repository implementation
 - [ ] Evaluation runner (execute a suite against a prompt version)
 - [ ] HTTP API
-- [ ] CI (vet, test, lint)
+- [x] CI (gofmt, vet, test)
+- [ ] Linting (golangci-lint)
 
 ## License
 
