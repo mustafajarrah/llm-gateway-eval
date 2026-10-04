@@ -171,7 +171,7 @@ func ParseRoutes(spec string) ([]domain.Route, error) {
 		}
 		name, targets, ok := strings.Cut(part, "=")
 		if !ok {
-			return nil, fmt.Errorf("route %q is not name=provider:model,...", part)
+			return nil, fmt.Errorf("route %q does not have the form name=provider:model", part)
 		}
 		route := domain.Route{Name: strings.TrimSpace(name)}
 		for _, raw := range strings.Split(targets, ",") {

@@ -1,4 +1,4 @@
-.PHONY: build run test cover fmt vet check docker clean
+.PHONY: build run test cover fmt vet lint check docker clean
 
 BIN := bin/gateway
 IMAGE := llm-gateway-eval
@@ -21,7 +21,10 @@ fmt: ## Format the code
 vet: ## Run go vet
 	go vet ./...
 
-check: vet test ## Everything CI runs
+lint: ## Run staticcheck
+	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+
+check: vet lint test ## Everything CI runs
 	@unformatted="$$(gofmt -l .)"; \
 	if [ -n "$$unformatted" ]; then echo "These files need gofmt:"; echo "$$unformatted"; exit 1; fi
 
