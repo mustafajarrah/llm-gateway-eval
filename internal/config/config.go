@@ -53,6 +53,15 @@ type Config struct {
 	// GATEWAY_ATTEMPT_TIMEOUT); zero keeps the gateway defaults.
 	MaxAttempts    int
 	AttemptTimeout time.Duration
+	// BreakerThreshold is the number of consecutive unhealthy calls that
+	// opens a provider's circuit breaker (GATEWAY_BREAKER_THRESHOLD); zero
+	// keeps the gateway default. BreakerDisabled is set by a threshold of 0
+	// in the environment.
+	BreakerThreshold int
+	BreakerDisabled  bool
+	// BreakerCooldown is how long an open breaker rejects calls
+	// (GATEWAY_BREAKER_COOLDOWN); zero keeps the gateway default.
+	BreakerCooldown time.Duration
 	// EvalConcurrency is the number of test cases run in parallel
 	// (GATEWAY_EVAL_CONCURRENCY); zero keeps the runner default.
 	EvalConcurrency int
@@ -133,12 +142,31 @@ func FromEnv(getenv func(string) string) (*Config, error) {
 	intVar("GATEWAY_MAX_ATTEMPTS", &cfg.MaxAttempts)
 	intVar("GATEWAY_EVAL_CONCURRENCY", &cfg.EvalConcurrency)
 
-	if raw := get("GATEWAY_ATTEMPT_TIMEOUT"); raw != "" {
+	durationVar := func(key string, dst *time.Duration) {
+		raw := get(key)
+		if raw == "" {
+			return
+		}
 		d, err := time.ParseDuration(raw)
 		if err != nil || d <= 0 {
-			errs = append(errs, fmt.Errorf("GATEWAY_ATTEMPT_TIMEOUT must be a positive duration such as 30s, got %q", raw))
-		} else {
-			cfg.AttemptTimeout = d
+			errs = append(errs, fmt.Errorf("%s must be a positive duration such as 30s, got %q", key, raw))
+			return
+		}
+		*dst = d
+	}
+	durationVar("GATEWAY_ATTEMPT_TIMEOUT", &cfg.AttemptTimeout)
+	durationVar("GATEWAY_BREAKER_COOLDOWN", &cfg.BreakerCooldown)
+
+	// Unlike the other counts, 0 is meaningful here: it disables the breaker.
+	if raw := get("GATEWAY_BREAKER_THRESHOLD"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		switch {
+		case err != nil || n < 0:
+			errs = append(errs, fmt.Errorf("GATEWAY_BREAKER_THRESHOLD must be a non-negative integer, got %q", raw))
+		case n == 0:
+			cfg.BreakerDisabled = true
+		default:
+			cfg.BreakerThreshold = n
 		}
 	}
 

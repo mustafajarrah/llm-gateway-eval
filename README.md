@@ -85,6 +85,16 @@ The gateway tries each target in order:
 
 The response says which provider and model served the request.
 
+### Circuit breaker
+
+Each provider has a circuit breaker, so a provider that is down stops costing every request its retries and backoff.
+
+- After 5 consecutive unhealthy calls (timeouts, 429s, 5xx, connection failures) the breaker **opens**: for 30 seconds the provider is skipped without being called. A route moves straight to its next target; a pinned request fails at once with a 502 whose message says the circuit breaker is open.
+- After the cooldown the breaker is **half-open**: one probe request goes through. If it succeeds the breaker closes; if not, it reopens for another cooldown.
+- A 4xx answer does not count against the provider, since it means the provider is up and rejected that request.
+
+`GET /v1/providers` reports each provider's state under `circuits` (`closed`, `open` or `half_open`). The state is kept in memory, per process.
+
 ## Evaluating prompts
 
 The walkthrough below creates a prompt, a version and two test cases, then runs the suite. It assumes the Ollama setup from the quick start.
@@ -154,7 +164,7 @@ A test case that cannot be executed (template error, provider failure) is record
 | Method and path | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness check (never authenticated) |
-| `GET /v1/providers` | Configured providers and routes |
+| `GET /v1/providers` | Configured providers, routes and circuit breaker states |
 | `POST /v1/completions` | Complete through the gateway |
 | `POST /v1/prompts` · `GET /v1/prompts` | Create and list prompts (`?limit=&offset=`) |
 | `GET /v1/prompts/{id}` · `DELETE /v1/prompts/{id}` | Read or delete a prompt; deleting cascades to its versions, test cases, runs and results |
@@ -199,6 +209,8 @@ Everything is configured through environment variables; [.env.example](.env.exam
 | `GATEWAY_ROUTES` | none | Fallback chains, see [Routing](#routing) |
 | `GATEWAY_MAX_ATTEMPTS` | `2` | Tries per target |
 | `GATEWAY_ATTEMPT_TIMEOUT` | `60s` | Limit of a single provider call |
+| `GATEWAY_BREAKER_THRESHOLD` | `5` | Consecutive unhealthy calls that open a provider's circuit breaker; `0` disables it |
+| `GATEWAY_BREAKER_COOLDOWN` | `30s` | How long an open breaker skips the provider |
 | `GATEWAY_EVAL_CONCURRENCY` | `4` | Test cases evaluated in parallel |
 | `ANTHROPIC_MAX_TOKENS` | `16000` | Output limit for Anthropic requests that set none |
 
@@ -278,7 +290,7 @@ Done:
 
 - [x] Domain entities, validation and ports
 - [x] Provider adapters for all six providers
-- [x] Gateway routing with retries and provider fallback
+- [x] Gateway routing with retries, provider fallback and circuit breakers
 - [x] SQLite and in-memory storage
 - [x] Evaluation runner and run comparison
 - [x] HTTP API, configuration and service binary
