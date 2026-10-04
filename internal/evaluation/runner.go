@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -25,10 +26,16 @@ type Completer interface {
 	Complete(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error)
 }
 
+// ErrShuttingDown is returned by Start once Shutdown has been called.
+var ErrShuttingDown = errors.New("evaluation runner is shutting down")
+
 // Config configures a Runner.
 type Config struct {
-	// Concurrency is the number of test cases executed in parallel.
+	// Concurrency is the number of test cases executed in parallel within
+	// one run.
 	Concurrency int
+	// Logger defaults to slog.Default().
+	Logger *slog.Logger
 }
 
 // Runner executes evaluation runs. It is safe for concurrent use.
@@ -37,7 +44,17 @@ type Runner struct {
 	evals       domain.EvaluationRepository
 	llm         Completer
 	concurrency int
+	log         *slog.Logger
 	now         func() time.Time
+
+	// background is the context of runs launched by Start; Shutdown cancels
+	// it. mu guards closed and makes Start and Shutdown mutually exclusive,
+	// so no run is launched after Shutdown began waiting.
+	background context.Context
+	cancel     context.CancelFunc
+	mu         sync.Mutex
+	closed     bool
+	wg         sync.WaitGroup
 }
 
 // NewRunner builds a Runner.
@@ -49,7 +66,22 @@ func NewRunner(prompts domain.PromptRepository, evals domain.EvaluationRepositor
 	if concurrency == 0 {
 		concurrency = DefaultConcurrency
 	}
-	return &Runner{prompts: prompts, evals: evals, llm: llm, concurrency: concurrency, now: time.Now}, nil
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	background, cancel := context.WithCancel(context.Background())
+	return &Runner{
+		prompts: prompts, evals: evals, llm: llm, concurrency: concurrency, log: logger, now: time.Now,
+		background: background, cancel: cancel,
+	}, nil
+}
+
+// job is a run that has been recorded as running and is ready to execute.
+type job struct {
+	run     domain.EvaluationRun
+	version *domain.PromptVersion
+	cases   []domain.EvaluationTestCase
 }
 
 // Report is a run together with its results, in test case order.
@@ -67,6 +99,63 @@ type Report struct {
 // as failed only when ctx is cancelled or the results cannot be stored; in
 // both cases the error is returned alongside the report built so far.
 func (r *Runner) Run(ctx context.Context, promptID string, version int) (*Report, error) {
+	j, err := r.prepare(ctx, promptID, version)
+	if err != nil {
+		return nil, err
+	}
+	return r.finish(ctx, j)
+}
+
+// Start records a new run and executes it in the background, returning the
+// run in RunStatusRunning as soon as it is recorded. The run does not depend
+// on ctx once Start returns; poll Report for its outcome. Problems that can
+// be detected up front (unknown prompt or version, no test cases) are
+// returned here and leave no run behind.
+func (r *Runner) Start(ctx context.Context, promptID string, version int) (*domain.EvaluationRun, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, ErrShuttingDown
+	}
+	j, err := r.prepare(ctx, promptID, version)
+	if err != nil {
+		return nil, err
+	}
+	started := j.run
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		if _, err := r.finish(r.background, j); err != nil {
+			r.log.Error("background evaluation run failed", "run_id", started.ID, "prompt_id", promptID, "error", err)
+		}
+	}()
+	return &started, nil
+}
+
+// Shutdown stops accepting background runs, cancels the ones in flight (they
+// are recorded as failed) and waits for them, or for ctx.
+func (r *Runner) Shutdown(ctx context.Context) error {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	r.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// prepare validates the request and records the run as running.
+func (r *Runner) prepare(ctx context.Context, promptID string, version int) (*job, error) {
 	v, err := r.version(ctx, promptID, version)
 	if err != nil {
 		return nil, err
@@ -79,18 +168,23 @@ func (r *Runner) Run(ctx context.Context, promptID string, version int) (*Report
 		return nil, fmt.Errorf("%w: prompt %q has no test cases to run", domain.ErrInvalidInput, promptID)
 	}
 
-	run := domain.EvaluationRun{
+	j := &job{version: v, cases: cases, run: domain.EvaluationRun{
 		PromptID:        promptID,
 		PromptVersionID: v.ID,
 		Version:         v.Version,
 		Status:          domain.RunStatusRunning,
 		StartedAt:       r.now().UTC(),
-	}
-	if err := r.evals.CreateRun(ctx, &run); err != nil {
+	}}
+	if err := r.evals.CreateRun(ctx, &j.run); err != nil {
 		return nil, err
 	}
+	return j, nil
+}
 
-	results := r.execute(ctx, &run, v, cases)
+// finish executes a prepared run and records its outcome.
+func (r *Runner) finish(ctx context.Context, j *job) (*Report, error) {
+	run := j.run
+	results := r.execute(ctx, &run, j.version, j.cases)
 
 	// From here on the outcome must be recorded even if the caller is gone.
 	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)

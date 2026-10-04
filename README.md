@@ -137,11 +137,19 @@ curl -s http://127.0.0.1:8080/v1/prompts/$PROMPT_ID/test-cases -d '{
 }'
 ```
 
-Run the suite against the latest version. The call blocks until the run is over and returns the run with one result per test case:
+Run the suite against the latest version. With `wait=true` the call blocks until the run is over and returns the run with one result per test case:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/v1/prompts/$PROMPT_ID/runs
+curl -s -X POST "http://127.0.0.1:8080/v1/prompts/$PROMPT_ID/runs?wait=true"
 ```
+
+Without `wait`, the call answers `202 Accepted` at once with the run in the `running` state, and the suite executes in the background. Poll the run until its status is `completed` or `failed`:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/runs/$RUN_ID
+```
+
+Results are stored when the run finishes, so a running run has none yet. A run still in the background when the service stops is recorded as `failed`.
 
 After adding a second version, run again and compare the two runs to see what regressed and what improved:
 
@@ -172,9 +180,9 @@ A test case that cannot be executed (template error, provider failure) is record
 | `GET /v1/prompts/{id}/versions/{n}` | Read version `n`, or `latest` |
 | `POST /v1/prompts/{id}/test-cases` · `GET /v1/prompts/{id}/test-cases` | Create and list test cases |
 | `GET /v1/test-cases/{id}` · `DELETE /v1/test-cases/{id}` | Read or delete a test case |
-| `POST /v1/prompts/{id}/runs` | Run the suite; optional body `{"version": n}` |
+| `POST /v1/prompts/{id}/runs` | Start a run in the background (202); `?wait=true` blocks and returns the report (201). Optional body `{"version": n}` |
 | `GET /v1/prompts/{id}/runs` | List runs, newest first (`?limit=&offset=`) |
-| `GET /v1/runs/{id}` | A run with its results |
+| `GET /v1/runs/{id}` | A run, with its results once it has finished |
 | `GET /v1/comparisons?base=&candidate=` | Regressions and improvements between two runs |
 
 Collections are returned as `{"data": [...]}`. Request bodies are decoded strictly: an unknown field is a 400.
@@ -193,6 +201,7 @@ Errors share one shape:
 | 409 | `conflict` | Name or ID already taken |
 | 413 | `body_too_large` | Body over 1 MB |
 | 502 | `provider_error` | The upstream provider failed; includes `provider` and `upstream_status` |
+| 503 | `unavailable` | The service is shutting down and takes no new runs |
 | 504 | `timeout` | The request timed out |
 | 500 | `internal` | Unexpected failure; details are in the server log only |
 
@@ -292,7 +301,7 @@ Done:
 - [x] Provider adapters for all six providers
 - [x] Gateway routing with retries, provider fallback and circuit breakers
 - [x] SQLite and in-memory storage
-- [x] Evaluation runner and run comparison
+- [x] Evaluation runner (background or blocking) and run comparison
 - [x] HTTP API, configuration and service binary
 - [x] CI (gofmt, vet, staticcheck, tests, Docker build)
 
@@ -303,7 +312,6 @@ Not done yet:
 - [ ] Tool calling and structured output
 - [ ] Cost tracking from token usage
 - [ ] Graded scoring (semantic similarity, LLM-as-judge)
-- [ ] Asynchronous evaluation runs
 - [ ] Several `openai_compatible` endpoints at once
 - [ ] Metrics and tracing
 

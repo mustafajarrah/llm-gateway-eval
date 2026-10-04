@@ -309,6 +309,133 @@ func TestRunStorageFailures(t *testing.T) {
 	}
 }
 
+// waitForRun polls until the run leaves the running state.
+func waitForRun(t *testing.T, f *fixture, runID string) *domain.EvaluationRun {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		run, err := f.store.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetRun() error = %v", err)
+		}
+		if run.Status != domain.RunStatusRunning {
+			return run
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("run %s is still running", runID)
+	return nil
+}
+
+func TestStartRunsInTheBackground(t *testing.T) {
+	release := make(chan struct{})
+	llm := completerFunc(func(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error) {
+		<-release
+		return echo(ctx, req)
+	})
+	f := newFixture(t, llm, "{{.in}}")
+	f.addCase(t, "case", "x", "x", domain.MatchExact)
+
+	// The request context ends as soon as Start returns, as an HTTP
+	// request's would; the run must not depend on it.
+	reqCtx, cancel := context.WithCancel(ctx)
+	started, err := f.runner.Start(reqCtx, f.prompt.ID, 0)
+	cancel()
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if started.ID == "" || started.Status != domain.RunStatusRunning || started.Version != 1 || !started.FinishedAt.IsZero() {
+		t.Errorf("Start() = %+v, want a running run", started)
+	}
+	if stored, _ := f.store.GetRun(ctx, started.ID); stored == nil || stored.Status != domain.RunStatusRunning {
+		t.Errorf("stored run = %+v, want it visible as running while in flight", stored)
+	}
+
+	close(release)
+	finished := waitForRun(t, f, started.ID)
+	if finished.Status != domain.RunStatusCompleted || finished.Summary.Passed != 1 || finished.FinishedAt.IsZero() {
+		t.Errorf("finished run = %+v", finished)
+	}
+	report, err := f.runner.Report(ctx, started.ID)
+	if err != nil || len(report.Results) != 1 || !report.Results[0].Passed {
+		t.Errorf("report = %+v, %v", report, err)
+	}
+	if err := f.runner.Shutdown(ctx); err != nil {
+		t.Errorf("Shutdown() with nothing in flight error = %v", err)
+	}
+}
+
+func TestStartRejections(t *testing.T) {
+	f := newFixture(t, completerFunc(echo), "{{.in}}")
+	if _, err := f.runner.Start(ctx, f.prompt.ID, 0); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Errorf("no test cases: error = %v, want ErrInvalidInput", err)
+	}
+	if _, err := f.runner.Start(ctx, "missing", 0); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("unknown prompt: error = %v, want ErrNotFound", err)
+	}
+	if runs, _ := f.store.ListRuns(ctx, f.prompt.ID, domain.ListOptions{}); len(runs) != 0 {
+		t.Errorf("rejected starts left %d runs behind", len(runs))
+	}
+}
+
+func TestShutdownCancelsBackgroundRuns(t *testing.T) {
+	entered := make(chan struct{})
+	llm := completerFunc(func(ctx context.Context, _ *domain.LLMRequest) (*domain.LLMResponse, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	f := newFixture(t, llm, "{{.in}}")
+	f.addCase(t, "case", "x", "x", domain.MatchExact)
+
+	started, err := f.runner.Start(ctx, f.prompt.ID, 0)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	<-entered
+	if err := f.runner.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	// Shutdown waited, so the outcome is already recorded.
+	stored, err := f.store.GetRun(ctx, started.ID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if stored.Status != domain.RunStatusFailed || !strings.Contains(stored.Error, "run cancelled") || stored.FinishedAt.IsZero() {
+		t.Errorf("run after Shutdown = %+v, want it recorded as failed", stored)
+	}
+	if _, err := f.runner.Start(ctx, f.prompt.ID, 0); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("Start() after Shutdown error = %v, want ErrShuttingDown", err)
+	}
+}
+
+func TestShutdownGivesUpWhenItsContextEnds(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	// A completer that ignores cancellation.
+	llm := completerFunc(func(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error) {
+		close(entered)
+		<-release
+		return echo(ctx, req)
+	})
+	f := newFixture(t, llm, "{{.in}}")
+	f.addCase(t, "case", "x", "x", domain.MatchExact)
+	started, err := f.runner.Start(ctx, f.prompt.ID, 0)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	<-entered
+
+	shutdownCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if err := f.runner.Shutdown(shutdownCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown() error = %v, want context.DeadlineExceeded", err)
+	}
+	close(release)
+	waitForRun(t, f, started.ID)
+}
+
 func TestReportErrors(t *testing.T) {
 	f := newFixture(t, completerFunc(echo), "{{.in}}")
 	if _, err := f.runner.Report(ctx, "missing"); !errors.Is(err, domain.ErrNotFound) {

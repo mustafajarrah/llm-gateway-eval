@@ -39,6 +39,7 @@ type Gateway interface {
 // Evaluator runs and compares evaluation runs.
 type Evaluator interface {
 	Run(ctx context.Context, promptID string, version int) (*evaluation.Report, error)
+	Start(ctx context.Context, promptID string, version int) (*domain.EvaluationRun, error)
 	Report(ctx context.Context, runID string) (*evaluation.Report, error)
 	Compare(ctx context.Context, baseRunID, candidateRunID string) (*evaluation.Comparison, error)
 }
@@ -228,6 +229,8 @@ func classify(err error) (int, errorDetail) {
 		return http.StatusNotFound, errorDetail{Code: "not_found", Message: err.Error()}
 	case errors.Is(err, domain.ErrConflict):
 		return http.StatusConflict, errorDetail{Code: "conflict", Message: err.Error()}
+	case errors.Is(err, evaluation.ErrShuttingDown):
+		return http.StatusServiceUnavailable, errorDetail{Code: "unavailable", Message: "the service is shutting down"}
 	case errors.Is(err, context.Canceled):
 		return statusClientClosedRequest, errorDetail{Code: "cancelled", Message: "request cancelled"}
 	case errors.Is(err, context.DeadlineExceeded):
@@ -500,19 +503,42 @@ type createRunRequest struct {
 	Version int `json:"version"`
 }
 
-// createRun executes the prompt's test suite and answers once it is over.
+// createRun starts an evaluation run. By default it answers 202 with the run
+// in the "running" state and the suite executes in the background; the client
+// polls GET /v1/runs/{id}. With ?wait=true it blocks until the run is over
+// and answers 201 with the full report.
 func (a *api) createRun(w http.ResponseWriter, r *http.Request) {
+	wait := false
+	if raw := r.URL.Query().Get("wait"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			a.writeError(w, r, fmt.Errorf("%w: wait must be true or false, got %q", domain.ErrInvalidInput, raw))
+			return
+		}
+		wait = parsed
+	}
 	var body createRunRequest
 	if err := a.decode(w, r, &body, true); err != nil {
 		a.writeError(w, r, err)
 		return
 	}
-	report, err := a.evaluator.Run(r.Context(), r.PathValue("id"), body.Version)
+
+	if wait {
+		report, err := a.evaluator.Run(r.Context(), r.PathValue("id"), body.Version)
+		if err != nil {
+			a.writeError(w, r, err)
+			return
+		}
+		a.writeJSON(w, http.StatusCreated, report)
+		return
+	}
+	run, err := a.evaluator.Start(r.Context(), r.PathValue("id"), body.Version)
 	if err != nil {
 		a.writeError(w, r, err)
 		return
 	}
-	a.writeJSON(w, http.StatusCreated, report)
+	w.Header().Set("Location", "/v1/runs/"+run.ID)
+	a.writeJSON(w, http.StatusAccepted, run)
 }
 
 func (a *api) listRuns(w http.ResponseWriter, r *http.Request) {

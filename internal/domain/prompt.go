@@ -426,6 +426,11 @@ type EvaluationRepository interface {
 	// UpdateRun overwrites the status, summary, error and finish time of an
 	// existing run.
 	UpdateRun(ctx context.Context, run *EvaluationRun) error
+	// InterruptRuns marks every run still in RunStatusRunning as failed, with
+	// reason as its error and at as its finish time, and returns how many it
+	// changed. It is called at startup: a run left running by a previous
+	// process will never finish.
+	InterruptRuns(ctx context.Context, reason string, at time.Time) (int, error)
 	// GetRun returns the run with the given ID.
 	GetRun(ctx context.Context, id string) (*EvaluationRun, error)
 	// ListRuns returns the runs of a prompt, newest first.

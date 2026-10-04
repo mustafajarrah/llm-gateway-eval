@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/mustafajarrah/llm-gateway-eval/internal/config"
 	"github.com/mustafajarrah/llm-gateway-eval/internal/domain"
@@ -25,11 +26,16 @@ import (
 // provider keys, so that combination is refused rather than warned about.
 var ErrUnprotected = errors.New("refusing to listen on a non-loopback address without GATEWAY_API_KEY")
 
+// runShutdownTimeout is how long Close waits for background evaluation runs
+// to record their cancellation.
+const runShutdownTimeout = 15 * time.Second
+
 // App is the assembled service.
 type App struct {
 	// Handler serves the HTTP API.
 	Handler http.Handler
 	store   *sqlite.Store
+	runner  *evaluation.Runner
 }
 
 // New assembles the service described by cfg. The caller must Close it.
@@ -67,8 +73,19 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*App, er
 	}
 	app := &App{store: store}
 
-	runner, err := evaluation.NewRunner(store, store, gw, evaluation.Config{Concurrency: cfg.EvalConcurrency})
+	// A run still marked as running belongs to a process that is gone.
+	interrupted, err := store.InterruptRuns(ctx, "interrupted: the service stopped while the run was in progress", time.Now().UTC())
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	if interrupted > 0 {
+		logger.Warn("marked unfinished evaluation runs as failed", "runs", interrupted)
+	}
+
+	runner, err := evaluation.NewRunner(store, store, gw, evaluation.Config{Concurrency: cfg.EvalConcurrency, Logger: logger})
 	if err == nil {
+		app.runner = runner
 		app.Handler, err = httpapi.NewHandler(httpapi.Config{
 			Gateway:   gw,
 			Prompts:   store,
@@ -87,8 +104,13 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*App, er
 	return app, nil
 }
 
-// Close releases the storage.
-func (a *App) Close() error { return a.store.Close() }
+// Close cancels the evaluation runs still in the background, waits for them
+// to be recorded as failed, and releases the storage.
+func (a *App) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), runShutdownTimeout)
+	defer cancel()
+	return errors.Join(a.runner.Shutdown(ctx), a.store.Close())
+}
 
 // buildProviders creates one adapter per enabled provider.
 func buildProviders(cfg *config.Config) ([]domain.LLMProvider, error) {
