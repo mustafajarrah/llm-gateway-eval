@@ -297,8 +297,8 @@ func (r *LLMResponse) UnmarshalJSON(data []byte) error {
 
 // LLMProvider is the port every vendor adapter implements. Implementations
 // must be safe for concurrent use, honour ctx cancellation, and return a
-// *ProviderError for upstream failures so the fallback layer can decide
-// whether to try the next provider.
+// *ProviderError for upstream failures so the gateway can decide whether to
+// retry.
 type LLMProvider interface {
 	// Name returns the provider identifier.
 	Name() Provider
@@ -311,8 +311,11 @@ type ProviderError struct {
 	Provider Provider
 	// StatusCode is the upstream HTTP status, or 0 for transport-level errors.
 	StatusCode int
-	// Retryable reports whether the same request may succeed if retried or
-	// routed to another provider (timeouts, 429s, 5xx).
+	// Retryable reports whether the same request may succeed if sent to the
+	// same provider again (timeouts, 429s, 5xx). It does not govern fallback:
+	// a non-retryable failure such as a rejected API key or an unknown model
+	// is specific to one provider, so the gateway still tries the next target
+	// of a route.
 	Retryable bool
 	Err       error
 }
