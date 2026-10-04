@@ -3,6 +3,7 @@ package domain
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -38,14 +39,18 @@ func (p *Prompt) Validate() error {
 type PromptVersion struct {
 	ID       string `json:"id"`
 	PromptID string `json:"prompt_id"`
-	Version  int    `json:"version"`
+	// Version is assigned by the repository on creation; 0 means "not yet
+	// assigned".
+	Version int `json:"version"`
 	// Template is a Go text/template rendered with the test case (or caller)
 	// variables, e.g. "Summarise the following text:\n{{.text}}".
-	Template     string          `json:"template"`
-	SystemPrompt string          `json:"system_prompt,omitempty"`
-	Provider     Provider        `json:"provider"`
-	Model        string          `json:"model"`
-	Parameters   ModelParameters `json:"parameters"`
+	Template     string `json:"template"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	// Provider and Model follow the LLMRequest convention: with a Provider,
+	// Model is a vendor model identifier; without one, Model is a route name.
+	Provider   Provider        `json:"provider,omitempty"`
+	Model      string          `json:"model"`
+	Parameters ModelParameters `json:"parameters"`
 	// ChangeLog is a short human-readable note describing what changed.
 	ChangeLog string    `json:"change_log,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
@@ -57,21 +62,21 @@ func (v *PromptVersion) Validate() error {
 	if v.PromptID == "" {
 		errs = append(errs, errors.New("prompt_id is required"))
 	}
-	if v.Version < 1 {
-		errs = append(errs, fmt.Errorf("version must be >= 1, got %d", v.Version))
+	if v.Version < 0 {
+		errs = append(errs, fmt.Errorf("version must not be negative, got %d", v.Version))
 	}
 	if strings.TrimSpace(v.Template) == "" {
 		errs = append(errs, errors.New("template is required"))
 	} else if _, err := v.parse(); err != nil {
 		errs = append(errs, fmt.Errorf("template: %w", err))
 	}
-	if !v.Provider.Valid() {
+	if v.Provider != "" && !v.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("unknown provider %q", v.Provider))
 	}
 	if v.Model == "" {
 		errs = append(errs, errors.New("model is required"))
 	}
-	if err := v.Parameters.Validate(); err != nil {
+	if err := v.Parameters.ValidateFor(v.Provider); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -219,13 +224,136 @@ type EvaluationResult struct {
 	Passed       bool     `json:"passed"`
 	// Score is a normalised quality score in [0, 1]. Binary strategies use
 	// 0 or 1; graded scorers (e.g. LLM-as-judge) may use the full range.
-	Score   float64       `json:"score"`
-	Usage   TokenUsage    `json:"usage"`
-	Latency time.Duration `json:"latency"`
+	Score float64    `json:"score"`
+	Usage TokenUsage `json:"usage"`
+	// Latency is serialised as integer milliseconds under "latency_ms".
+	Latency time.Duration `json:"-"`
 	// Error is non-empty when the test case could not be executed (render
 	// failure, provider outage). Such results always have Passed == false.
 	Error     string    `json:"error,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// MarshalJSON encodes Latency as "latency_ms" instead of time.Duration's
+// default of raw nanoseconds.
+func (r EvaluationResult) MarshalJSON() ([]byte, error) {
+	type alias EvaluationResult
+	return json.Marshal(struct {
+		alias
+		LatencyMS int64 `json:"latency_ms"`
+	}{alias(r), r.Latency.Milliseconds()})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON.
+func (r *EvaluationResult) UnmarshalJSON(data []byte) error {
+	type alias EvaluationResult
+	aux := struct {
+		*alias
+		LatencyMS int64 `json:"latency_ms"`
+	}{alias: (*alias)(r)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	r.Latency = time.Duration(aux.LatencyMS) * time.Millisecond
+	return nil
+}
+
+// RunStatus is the lifecycle state of an EvaluationRun.
+type RunStatus string
+
+// Run lifecycle states.
+const (
+	// RunStatusRunning means test cases are still being executed.
+	RunStatusRunning RunStatus = "running"
+	// RunStatusCompleted means every test case produced a result, whether it
+	// passed, failed or errored.
+	RunStatusCompleted RunStatus = "completed"
+	// RunStatusFailed means the run was aborted before producing a full set
+	// of results (cancellation, storage failure).
+	RunStatusFailed RunStatus = "failed"
+)
+
+// Valid reports whether s is a known run status.
+func (s RunStatus) Valid() bool {
+	switch s {
+	case RunStatusRunning, RunStatusCompleted, RunStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// RunSummary aggregates the results of an evaluation run.
+type RunSummary struct {
+	Total  int `json:"total"`
+	Passed int `json:"passed"`
+	// Failed counts test cases that ran but did not match the expectation.
+	Failed int `json:"failed"`
+	// Errored counts test cases that could not be executed at all.
+	Errored int        `json:"errored"`
+	Usage   TokenUsage `json:"usage"`
+	// TotalLatencyMS is the sum of the per-result provider latencies.
+	TotalLatencyMS int64 `json:"total_latency_ms"`
+}
+
+// PassRate returns Passed / Total in [0, 1], or 0 for an empty run.
+func (s RunSummary) PassRate() float64 {
+	if s.Total == 0 {
+		return 0
+	}
+	return float64(s.Passed) / float64(s.Total)
+}
+
+// Summarize computes the aggregate of results.
+func Summarize(results []EvaluationResult) RunSummary {
+	var s RunSummary
+	for _, r := range results {
+		s.Total++
+		switch {
+		case r.Error != "":
+			s.Errored++
+		case r.Passed:
+			s.Passed++
+		default:
+			s.Failed++
+		}
+		s.Usage = s.Usage.Add(r.Usage)
+		s.TotalLatencyMS += r.Latency.Milliseconds()
+	}
+	return s
+}
+
+// EvaluationRun is one execution of a prompt's test suite against one prompt
+// version. It groups the EvaluationResult rows sharing its ID as RunID.
+type EvaluationRun struct {
+	ID              string     `json:"id"`
+	PromptID        string     `json:"prompt_id"`
+	PromptVersionID string     `json:"prompt_version_id"`
+	Version         int        `json:"version"`
+	Status          RunStatus  `json:"status"`
+	Summary         RunSummary `json:"summary"`
+	// Error explains why a run ended in RunStatusFailed.
+	Error      string    `json:"error,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitzero"`
+}
+
+// Validate checks the run's invariants.
+func (r *EvaluationRun) Validate() error {
+	var errs []error
+	if r.PromptID == "" {
+		errs = append(errs, errors.New("prompt_id is required"))
+	}
+	if r.PromptVersionID == "" {
+		errs = append(errs, errors.New("prompt_version_id is required"))
+	}
+	if !r.Status.Valid() {
+		errs = append(errs, fmt.Errorf("unknown run status %q", r.Status))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidInput, errors.Join(errs...))
+	}
+	return nil
 }
 
 // ListOptions controls pagination for list queries.
@@ -256,7 +384,8 @@ func (o ListOptions) Normalize() ListOptions {
 }
 
 // PromptRepository persists prompts and their versions. Implementations
-// return errors wrapping ErrNotFound or ErrConflict where applicable.
+// return errors wrapping ErrNotFound or ErrConflict where applicable. On
+// creation they assign an ID when it is empty and CreatedAt when it is zero.
 type PromptRepository interface {
 	// CreatePrompt stores a new prompt. It returns ErrConflict if the name is
 	// already taken.
@@ -280,7 +409,8 @@ type PromptRepository interface {
 	ListVersions(ctx context.Context, promptID string) ([]PromptVersion, error)
 }
 
-// EvaluationRepository persists test cases and evaluation results.
+// EvaluationRepository persists test cases, runs and evaluation results. Like
+// PromptRepository, it assigns missing IDs and timestamps on creation.
 type EvaluationRepository interface {
 	// CreateTestCase stores a new test case.
 	CreateTestCase(ctx context.Context, tc *EvaluationTestCase) error
@@ -290,6 +420,16 @@ type EvaluationRepository interface {
 	ListTestCases(ctx context.Context, promptID string) ([]EvaluationTestCase, error)
 	// DeleteTestCase removes a test case.
 	DeleteTestCase(ctx context.Context, id string) error
+
+	// CreateRun stores a new run.
+	CreateRun(ctx context.Context, run *EvaluationRun) error
+	// UpdateRun overwrites the status, summary, error and finish time of an
+	// existing run.
+	UpdateRun(ctx context.Context, run *EvaluationRun) error
+	// GetRun returns the run with the given ID.
+	GetRun(ctx context.Context, id string) (*EvaluationRun, error)
+	// ListRuns returns the runs of a prompt, newest first.
+	ListRuns(ctx context.Context, promptID string, opts ListOptions) ([]EvaluationRun, error)
 
 	// SaveResults stores a batch of results atomically: either all rows are
 	// written or none are.
