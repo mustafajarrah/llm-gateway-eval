@@ -2,8 +2,10 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -37,6 +39,75 @@ func (p Provider) Valid() bool {
 
 // String implements fmt.Stringer.
 func (p Provider) String() string { return string(p) }
+
+// MaxTemperature returns the highest sampling temperature the provider
+// accepts. Vendors disagree: Anthropic stops at 1 and Mistral at 1.5, while
+// OpenAI-style APIs and Gemini go up to 2.
+func (p Provider) MaxTemperature() float64 {
+	switch p {
+	case ProviderAnthropic:
+		return 1
+	case ProviderMistral:
+		return 1.5
+	default:
+		return 2
+	}
+}
+
+// Target is a concrete (provider, model) pair a request can be sent to.
+type Target struct {
+	Provider Provider `json:"provider"`
+	// Model is the vendor model identifier, e.g. "gpt-4o".
+	Model string `json:"model"`
+}
+
+// Validate checks that the target names a known provider and a model.
+func (t Target) Validate() error {
+	var errs []error
+	if !t.Provider.Valid() {
+		errs = append(errs, fmt.Errorf("unknown provider %q", t.Provider))
+	}
+	if strings.TrimSpace(t.Model) == "" {
+		errs = append(errs, errors.New("model is required"))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidInput, errors.Join(errs...))
+	}
+	return nil
+}
+
+// String implements fmt.Stringer, e.g. "openai:gpt-4o".
+func (t Target) String() string { return string(t.Provider) + ":" + t.Model }
+
+// Route is a named, ordered fallback chain. A request that does not pin a
+// provider uses its Model field as a route name; the gateway then tries each
+// target in order, substituting the target's own vendor model identifier. This
+// is what makes cross-provider fallback possible: a vendor model ID such as
+// "gpt-4o" means nothing to another vendor.
+type Route struct {
+	Name    string   `json:"name"`
+	Targets []Target `json:"targets"`
+}
+
+// Validate checks that the route has a name and at least one valid target.
+func (r Route) Validate() error {
+	var errs []error
+	if strings.TrimSpace(r.Name) == "" {
+		errs = append(errs, errors.New("route name is required"))
+	}
+	if len(r.Targets) == 0 {
+		errs = append(errs, errors.New("route needs at least one target"))
+	}
+	for i, t := range r.Targets {
+		if err := t.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("targets[%d]: %w", i, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: route %q: %w", ErrInvalidInput, r.Name, errors.Join(errs...))
+	}
+	return nil
+}
 
 // Role is the author of a chat message.
 type Role string
@@ -85,13 +156,37 @@ func (p ModelParameters) Validate() error {
 	return errors.Join(errs...)
 }
 
+// ValidateFor is Validate plus the limits specific to provider.
+func (p ModelParameters) ValidateFor(provider Provider) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if limit := provider.MaxTemperature(); p.Temperature != nil && *p.Temperature > limit {
+		return fmt.Errorf("temperature must be in [0, %g] for provider %s, got %g", limit, provider, *p.Temperature)
+	}
+	return nil
+}
+
+// ClampFor returns a copy of p with Temperature lowered to the provider's
+// maximum when it exceeds it. The gateway uses it when falling back along a
+// route, so that a temperature valid for the first target does not make every
+// stricter target fail.
+func (p ModelParameters) ClampFor(provider Provider) ModelParameters {
+	if limit := provider.MaxTemperature(); p.Temperature != nil && *p.Temperature > limit {
+		p.Temperature = &limit
+	}
+	return p
+}
+
 // LLMRequest is the provider-agnostic completion request accepted by the
 // gateway. Provider adapters translate it into vendor-specific payloads.
 type LLMRequest struct {
-	// Provider optionally pins the request to a single vendor. When empty the
-	// gateway routes according to its configured fallback chain.
+	// Provider optionally pins the request to a single vendor, with no
+	// fallback. When empty, Model names a Route and the gateway walks that
+	// route's fallback chain.
 	Provider Provider `json:"provider,omitempty"`
-	// Model is the vendor model identifier, e.g. "gpt-4o" or "claude-sonnet-4-5".
+	// Model is the vendor model identifier (e.g. "gpt-4o") when Provider is
+	// set, and a route name (e.g. "fast") when it is not.
 	Model        string          `json:"model"`
 	SystemPrompt string          `json:"system_prompt,omitempty"`
 	Messages     []Message       `json:"messages"`
@@ -122,7 +217,7 @@ func (r *LLMRequest) Validate() error {
 			errs = append(errs, fmt.Errorf("messages[%d]: content is required", i))
 		}
 	}
-	if err := r.Parameters.Validate(); err != nil {
+	if err := r.Parameters.ValidateFor(r.Provider); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -170,9 +265,34 @@ type LLMResponse struct {
 	Content      string       `json:"content"`
 	FinishReason FinishReason `json:"finish_reason"`
 	Usage        TokenUsage   `json:"usage"`
-	// Latency is the wall-clock time spent waiting on the provider.
-	Latency   time.Duration `json:"latency"`
+	// Latency is the wall-clock time spent waiting on the provider. It is
+	// serialised as integer milliseconds under "latency_ms".
+	Latency   time.Duration `json:"-"`
 	CreatedAt time.Time     `json:"created_at"`
+}
+
+// MarshalJSON encodes Latency as "latency_ms" instead of time.Duration's
+// default of raw nanoseconds.
+func (r LLMResponse) MarshalJSON() ([]byte, error) {
+	type alias LLMResponse
+	return json.Marshal(struct {
+		alias
+		LatencyMS int64 `json:"latency_ms"`
+	}{alias(r), r.Latency.Milliseconds()})
+}
+
+// UnmarshalJSON is the inverse of MarshalJSON.
+func (r *LLMResponse) UnmarshalJSON(data []byte) error {
+	type alias LLMResponse
+	aux := struct {
+		*alias
+		LatencyMS int64 `json:"latency_ms"`
+	}{alias: (*alias)(r)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	r.Latency = time.Duration(aux.LatencyMS) * time.Millisecond
+	return nil
 }
 
 // LLMProvider is the port every vendor adapter implements. Implementations

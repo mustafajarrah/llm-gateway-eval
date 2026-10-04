@@ -1,8 +1,11 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 func validVersion() *PromptVersion {
@@ -34,7 +37,12 @@ func TestPromptVersionValidate(t *testing.T) {
 	}{
 		{name: "valid", mutate: func(*PromptVersion) {}},
 		{name: "missing prompt id", mutate: func(v *PromptVersion) { v.PromptID = "" }, wantErr: true},
-		{name: "zero version", mutate: func(v *PromptVersion) { v.Version = 0 }, wantErr: true},
+		{name: "unassigned version", mutate: func(v *PromptVersion) { v.Version = 0 }},
+		{name: "negative version", mutate: func(v *PromptVersion) { v.Version = -1 }, wantErr: true},
+		{name: "route instead of provider", mutate: func(v *PromptVersion) { v.Provider, v.Model = "", "fast" }},
+		{name: "temperature above provider limit", mutate: func(v *PromptVersion) {
+			v.Provider, v.Parameters.Temperature = ProviderAnthropic, ptr(1.5)
+		}, wantErr: true},
 		{name: "empty template", mutate: func(v *PromptVersion) { v.Template = " " }, wantErr: true},
 		{name: "unparsable template", mutate: func(v *PromptVersion) { v.Template = "{{.text" }, wantErr: true},
 		{name: "unknown provider", mutate: func(v *PromptVersion) { v.Provider = "x" }, wantErr: true},
@@ -197,5 +205,77 @@ func TestEnumValidity(t *testing.T) {
 	}
 	if !RoleUser.Valid() || !RoleAssistant.Valid() || Role("system").Valid() {
 		t.Error("Role.Valid() misclassified a value")
+	}
+}
+
+func TestEvaluationResultJSON(t *testing.T) {
+	in := EvaluationResult{ID: "r1", RunID: "run", Passed: true, Score: 1, Latency: 1500 * time.Millisecond}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(data), `"latency_ms":1500`) {
+		t.Errorf("Marshal() = %s, want latency_ms 1500", data)
+	}
+	var out EvaluationResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if out != in {
+		t.Errorf("round trip = %+v, want %+v", out, in)
+	}
+	if err := json.Unmarshal([]byte(`{"passed":"yes"}`), &out); err == nil {
+		t.Error("Unmarshal() accepted a malformed result")
+	}
+}
+
+func TestSummarize(t *testing.T) {
+	got := Summarize([]EvaluationResult{
+		{Passed: true, Usage: TokenUsage{InputTokens: 10, OutputTokens: 2}, Latency: 100 * time.Millisecond},
+		{Passed: false, Usage: TokenUsage{InputTokens: 5, OutputTokens: 1}, Latency: 50 * time.Millisecond},
+		{Error: "provider down"},
+	})
+	want := RunSummary{
+		Total: 3, Passed: 1, Failed: 1, Errored: 1,
+		Usage:          TokenUsage{InputTokens: 15, OutputTokens: 3},
+		TotalLatencyMS: 150,
+	}
+	if got != want {
+		t.Errorf("Summarize() = %+v, want %+v", got, want)
+	}
+	if rate := got.PassRate(); rate < 0.333 || rate > 0.334 {
+		t.Errorf("PassRate() = %v, want 1/3", rate)
+	}
+	if rate := (RunSummary{}).PassRate(); rate != 0 {
+		t.Errorf("PassRate() of empty summary = %v, want 0", rate)
+	}
+}
+
+func TestEvaluationRunValidate(t *testing.T) {
+	valid := EvaluationRun{PromptID: "p1", PromptVersionID: "v1", Status: RunStatusRunning}
+	if err := valid.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	for _, status := range []RunStatus{RunStatusRunning, RunStatusCompleted, RunStatusFailed} {
+		if !status.Valid() {
+			t.Errorf("RunStatus(%q).Valid() = false", status)
+		}
+	}
+	invalid := EvaluationRun{Status: "paused"}
+	err := invalid.Validate()
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	for _, want := range []string{"prompt_id", "prompt_version_id", "paused"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestNewID(t *testing.T) {
+	a, b := NewID(), NewID()
+	if len(a) != 32 || a == b {
+		t.Errorf("NewID() returned %q then %q", a, b)
 	}
 }
