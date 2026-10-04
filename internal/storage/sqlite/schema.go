@@ -80,4 +80,6 @@ CREATE TABLE results (
 CREATE INDEX results_run ON results(run_id);
 CREATE INDEX results_version ON results(prompt_version_id);
 `,
+	// NULL means no price was configured when the result was recorded.
+	`ALTER TABLE results ADD COLUMN cost_usd REAL;`,
 }

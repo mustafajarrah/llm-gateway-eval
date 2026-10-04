@@ -172,6 +172,38 @@ func TestTargetAndRoute(t *testing.T) {
 	}
 }
 
+func TestPrice(t *testing.T) {
+	price := Price{InputPerMTok: 4, OutputPerMTok: 20}
+	got := price.Cost(TokenUsage{InputTokens: 250_000, OutputTokens: 50_000})
+	if got != 2 {
+		t.Errorf("Cost() = %g, want 2 (1 for input + 1 for output)", got)
+	}
+	if got := (Price{}).Cost(TokenUsage{InputTokens: 1000}); got != 0 {
+		t.Errorf("Cost() at a zero price = %g", got)
+	}
+	if err := price.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := (Price{InputPerMTok: -1}).Validate(); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("negative price: expected ErrInvalidInput, got %v", err)
+	}
+
+	valid := ModelPrice{Target: Target{Provider: ProviderOpenAI, Model: "gpt-4o"}, Price: price}
+	if err := valid.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := (ModelPrice{Price: price}).Validate(); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("missing target: expected ErrInvalidInput, got %v", err)
+	}
+	if err := (ModelPrice{Target: valid.Target, Price: Price{OutputPerMTok: -2}}).Validate(); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("negative price: expected ErrInvalidInput, got %v", err)
+	}
+	data, err := json.Marshal(valid)
+	if err != nil || string(data) != `{"provider":"openai","model":"gpt-4o","input_per_mtok":4,"output_per_mtok":20}` {
+		t.Errorf("Marshal() = %s, %v", data, err)
+	}
+}
+
 func TestLLMResponseJSON(t *testing.T) {
 	in := LLMResponse{
 		ID: "resp_1", Provider: ProviderOpenAI, Model: "gpt-4o", Content: "hi",
@@ -193,6 +225,15 @@ func TestLLMResponseJSON(t *testing.T) {
 	}
 	if out != in {
 		t.Errorf("round trip = %+v, want %+v", out, in)
+	}
+	if strings.Contains(string(data), "cost_usd") {
+		t.Errorf("Marshal() = %s, want no cost_usd when the cost is unknown", data)
+	}
+	in.CostUSD = ptr(0.0125)
+	data, _ = json.Marshal(in)
+	var priced LLMResponse
+	if err := json.Unmarshal(data, &priced); err != nil || priced.CostUSD == nil || *priced.CostUSD != 0.0125 {
+		t.Errorf("cost did not round-trip: %s -> %+v (%v)", data, priced, err)
 	}
 	if err := json.Unmarshal([]byte(`{"usage":"x"}`), &out); err == nil {
 		t.Error("Unmarshal() accepted a malformed response")

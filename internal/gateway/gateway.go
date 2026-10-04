@@ -32,6 +32,9 @@ type Config struct {
 	// Routes are the named fallback chains. Every target must name a
 	// registered provider.
 	Routes []domain.Route
+	// Prices are used to estimate the cost of each completion. A target
+	// without a price yields responses without a cost.
+	Prices []domain.ModelPrice
 	// MaxAttempts is how many times one target is tried before moving on.
 	MaxAttempts int
 	// AttemptTimeout bounds a single call to a provider.
@@ -60,6 +63,7 @@ type Gateway struct {
 	// disabled.
 	breakers       map[domain.Provider]*breaker
 	routes         map[string]domain.Route
+	prices         map[domain.Target]domain.Price
 	maxAttempts    int
 	attemptTimeout time.Duration
 	baseBackoff    time.Duration
@@ -77,6 +81,7 @@ func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 		providers:      make(map[domain.Provider]domain.LLMProvider, len(providers)),
 		breakers:       make(map[domain.Provider]*breaker, len(providers)),
 		routes:         make(map[string]domain.Route, len(cfg.Routes)),
+		prices:         make(map[domain.Target]domain.Price, len(cfg.Prices)),
 		maxAttempts:    cfg.MaxAttempts,
 		attemptTimeout: cfg.AttemptTimeout,
 		baseBackoff:    cfg.BaseBackoff,
@@ -140,6 +145,15 @@ func New(providers []domain.LLMProvider, cfg Config) (*Gateway, error) {
 		}
 		g.routes[route.Name] = route
 	}
+	for _, price := range cfg.Prices {
+		if err := price.Validate(); err != nil {
+			return nil, fmt.Errorf("price for %s: %w", price.Target, err)
+		}
+		if _, dup := g.prices[price.Target]; dup {
+			return nil, fmt.Errorf("%w: price for %s defined twice", domain.ErrInvalidInput, price.Target)
+		}
+		g.prices[price.Target] = price.Price
+	}
 	return g, nil
 }
 
@@ -151,6 +165,16 @@ func (g *Gateway) Providers() []domain.Provider {
 	}
 	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
 	return names
+}
+
+// Prices returns the configured prices ordered by provider, then model.
+func (g *Gateway) Prices() []domain.ModelPrice {
+	prices := make([]domain.ModelPrice, 0, len(g.prices))
+	for target, price := range g.prices {
+		prices = append(prices, domain.ModelPrice{Target: target, Price: price})
+	}
+	sort.Slice(prices, func(i, j int) bool { return prices[i].Target.String() < prices[j].Target.String() })
+	return prices
 }
 
 // Circuits returns the circuit breaker state of every provider: CircuitClosed,
@@ -187,6 +211,9 @@ func (g *Gateway) Routes() []domain.Route {
 // without being called, so a route moves on to its next target at once
 // instead of spending retries and backoff on a provider known to be down.
 //
+// A successful response carries an estimated cost when a price is configured
+// for the target that served it.
+//
 // When every target fails, the returned error wraps the *domain.ProviderError
 // of each one.
 func (g *Gateway) Complete(ctx context.Context, req *domain.LLMRequest) (*domain.LLMResponse, error) {
@@ -209,7 +236,7 @@ func (g *Gateway) Complete(ctx context.Context, req *domain.LLMRequest) (*domain
 
 		resp, err := g.tryTarget(ctx, g.providers[target.Provider], &attemptReq)
 		if err == nil {
-			return resp, nil
+			return g.withCost(resp, target), nil
 		}
 		if ctx.Err() != nil {
 			// The caller gave up; do not burn the remaining targets.
@@ -221,6 +248,21 @@ func (g *Gateway) Complete(ctx context.Context, req *domain.LLMRequest) (*domain
 		return nil, failures[0]
 	}
 	return nil, fmt.Errorf("route %q: all %d targets failed: %w", req.Model, len(targets), errors.Join(failures...))
+}
+
+// withCost returns resp with its estimated cost, when the target that served
+// it has a price. The price is looked up by the model that was requested from
+// the provider, not the one it reports back, which is often a dated variant
+// of the same model.
+func (g *Gateway) withCost(resp *domain.LLMResponse, target domain.Target) *domain.LLMResponse {
+	price, ok := g.prices[target]
+	if !ok {
+		return resp
+	}
+	priced := *resp
+	cost := price.Cost(resp.Usage)
+	priced.CostUSD = &cost
+	return &priced
 }
 
 // resolve turns a request into the ordered targets to try. routed reports

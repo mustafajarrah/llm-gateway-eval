@@ -69,6 +69,18 @@ It is about a hundred lines in `internal/gateway/breaker.go` rather than a libra
 
 *To change:* `GATEWAY_BREAKER_THRESHOLD` (0 disables) and `GATEWAY_BREAKER_COOLDOWN`.
 
+### Cost is estimated from configured prices, with none built in
+
+`GATEWAY_PRICES` maps `provider:model` to input and output rates. The gateway attaches `cost_usd` to a completion when the target that served it has a price; results store that cost, and run summaries add it up and count the results that had none (`unpriced`).
+
+- **No default price table.** Vendor prices change, and a hard-coded table goes stale silently. The cost of that choice is that nothing has a cost until you configure it.
+- **Unknown is not zero.** An unpriced completion has no `cost_usd`; a free model is priced explicitly at `0/0`.
+- **Costs are frozen when recorded**, so history is not rewritten by a later price change. It also means a wrong price stays wrong in past runs.
+- **It is an estimate.** All input tokens are billed at the input rate; cached-prompt and batch discounts are ignored, and for Gemini thinking tokens are counted as output.
+- **Exact match on the requested model.** A price for `gpt-4o` does not apply to a request for `gpt-4o-2024-08-06`.
+
+*To change:* prices could move into the database with an effective date, which would allow repricing past runs.
+
 ## Storage
 
 ### SQLite through a pure-Go driver ([#9](https://github.com/mustafajarrah/llm-gateway-eval/pull/9))

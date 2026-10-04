@@ -49,6 +49,8 @@ type Config struct {
 
 	// Routes are the fallback chains (GATEWAY_ROUTES).
 	Routes []domain.Route
+	// Prices are the per-model prices used to estimate cost (GATEWAY_PRICES).
+	Prices []domain.ModelPrice
 	// MaxAttempts and AttemptTimeout tune retries (GATEWAY_MAX_ATTEMPTS,
 	// GATEWAY_ATTEMPT_TIMEOUT); zero keeps the gateway defaults.
 	MaxAttempts    int
@@ -176,6 +178,12 @@ func FromEnv(getenv func(string) string) (*Config, error) {
 	}
 	cfg.Routes = routes
 
+	prices, err := ParsePrices(get("GATEWAY_PRICES"))
+	if err != nil {
+		errs = append(errs, fmt.Errorf("GATEWAY_PRICES: %v", err))
+	}
+	cfg.Prices = prices
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("%w: %w", domain.ErrInvalidInput, errors.Join(errs...))
 	}
@@ -218,6 +226,52 @@ func ParseRoutes(spec string) ([]domain.Route, error) {
 		routes = append(routes, route)
 	}
 	return routes, nil
+}
+
+// ParsePrices parses the GATEWAY_PRICES syntax: entries separated by ";",
+// each "provider:model=input/output" with both rates in US dollars per
+// million tokens. For example:
+//
+//	anthropic:claude-opus-5-5=4/20;openai:gpt-4o-mini=0.15/0.60;ollama:llama3.2=0/0
+//
+// As in ParseRoutes, only the first ":" separates the provider from the
+// model.
+func ParsePrices(spec string) ([]domain.ModelPrice, error) {
+	var prices []domain.ModelPrice
+	for _, part := range strings.Split(spec, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// Model IDs never contain "=", so the last one separates the rates.
+		cut := strings.LastIndex(part, "=")
+		if cut < 0 {
+			return nil, fmt.Errorf("price %q does not have the form provider:model=input/output", part)
+		}
+		target, rates := strings.TrimSpace(part[:cut]), strings.TrimSpace(part[cut+1:])
+		provider, model, ok := strings.Cut(target, ":")
+		if !ok {
+			return nil, fmt.Errorf("price %q: %q is not provider:model", part, target)
+		}
+		rawIn, rawOut, ok := strings.Cut(rates, "/")
+		if !ok {
+			return nil, fmt.Errorf("price %q: %q is not input/output", part, rates)
+		}
+		input, errIn := strconv.ParseFloat(strings.TrimSpace(rawIn), 64)
+		output, errOut := strconv.ParseFloat(strings.TrimSpace(rawOut), 64)
+		if errIn != nil || errOut != nil {
+			return nil, fmt.Errorf("price %q: rates must be numbers, got %q", part, rates)
+		}
+		price := domain.ModelPrice{
+			Target: domain.Target{Provider: domain.Provider(strings.TrimSpace(provider)), Model: strings.TrimSpace(model)},
+			Price:  domain.Price{InputPerMTok: input, OutputPerMTok: output},
+		}
+		if err := price.Validate(); err != nil {
+			return nil, fmt.Errorf("price %q: %v", part, err)
+		}
+		prices = append(prices, price)
+	}
+	return prices, nil
 }
 
 // LoopbackOnly reports whether Addr accepts connections from this machine

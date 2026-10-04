@@ -256,6 +256,42 @@ func (u TokenUsage) Add(other TokenUsage) TokenUsage {
 	}
 }
 
+// Price is what a provider charges for a model, in US dollars per million
+// tokens.
+type Price struct {
+	InputPerMTok  float64 `json:"input_per_mtok"`
+	OutputPerMTok float64 `json:"output_per_mtok"`
+}
+
+// Validate checks that neither rate is negative.
+func (p Price) Validate() error {
+	if p.InputPerMTok < 0 || p.OutputPerMTok < 0 {
+		return fmt.Errorf("%w: prices must not be negative, got %g/%g", ErrInvalidInput, p.InputPerMTok, p.OutputPerMTok)
+	}
+	return nil
+}
+
+// Cost returns the price of usage in US dollars. It is an estimate: it bills
+// every input token at the plain input rate, ignoring vendor discounts such as
+// cached-prompt or batch pricing.
+func (p Price) Cost(usage TokenUsage) float64 {
+	return (float64(usage.InputTokens)*p.InputPerMTok + float64(usage.OutputTokens)*p.OutputPerMTok) / 1e6
+}
+
+// ModelPrice is the price of one target.
+type ModelPrice struct {
+	Target
+	Price
+}
+
+// Validate checks the target and the price.
+func (m ModelPrice) Validate() error {
+	if err := m.Target.Validate(); err != nil {
+		return err
+	}
+	return m.Price.Validate()
+}
+
 // LLMResponse is the provider-agnostic completion result.
 type LLMResponse struct {
 	// ID is the vendor-assigned response identifier, kept for traceability.
@@ -265,6 +301,10 @@ type LLMResponse struct {
 	Content      string       `json:"content"`
 	FinishReason FinishReason `json:"finish_reason"`
 	Usage        TokenUsage   `json:"usage"`
+	// CostUSD is the estimated cost of the completion, set by the gateway
+	// when a price is configured for the target that served it and nil
+	// otherwise.
+	CostUSD *float64 `json:"cost_usd,omitempty"`
 	// Latency is the wall-clock time spent waiting on the provider. It is
 	// serialised as integer milliseconds under "latency_ms".
 	Latency   time.Duration `json:"-"`

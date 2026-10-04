@@ -518,6 +518,7 @@ func testResults(t *testing.T, s Store) {
 			Provider: domain.ProviderAnthropic, Model: "claude-haiku-4-5",
 			ActualOutput: "Go is great", Passed: true, Score: 1,
 			Usage:   domain.TokenUsage{InputTokens: 12, OutputTokens: 4},
+			CostUSD: ptr(0.0125),
 			Latency: 345 * time.Millisecond,
 		},
 		{RunID: run.ID, TestCaseID: "tc2", PromptVersionID: v.ID, Score: 0.25, Error: "provider down"},
@@ -549,8 +550,21 @@ func testResults(t *testing.T, s Store) {
 		first.Latency != 345*time.Millisecond || first.Error != "" || !first.CreatedAt.Equal(batch[0].CreatedAt) {
 		t.Errorf("result did not round-trip: %+v, want %+v", first, batch[0])
 	}
-	if got[1].Passed || got[1].Score != 0.25 || got[1].Error != "provider down" {
-		t.Errorf("result did not round-trip: %+v", got[1])
+	if first.CostUSD == nil || *first.CostUSD != 0.0125 {
+		t.Errorf("cost did not round-trip: %v", first.CostUSD)
+	}
+	if got[1].Passed || got[1].Score != 0.25 || got[1].Error != "provider down" || got[1].CostUSD != nil {
+		t.Errorf("result did not round-trip: %+v, want no cost", got[1])
+	}
+	// A zero cost (a free model) is distinct from an unknown one.
+	free := []domain.EvaluationResult{{RunID: otherRun.ID, TestCaseID: "free", PromptVersionID: "other-version", CostUSD: ptr(0.0)}}
+	if err := s.SaveResults(ctx, free); err != nil {
+		t.Fatalf("SaveResults() error = %v", err)
+	}
+	*free[0].CostUSD = 99 // must not reach the store
+	stored, err := s.ListResultsByVersion(ctx, "other-version", domain.ListOptions{})
+	if err != nil || len(stored) != 1 || stored[0].CostUSD == nil || *stored[0].CostUSD != 0 {
+		t.Errorf("free result = %+v, %v; want a stored cost of exactly 0", stored, err)
 	}
 
 	byVersion, err := s.ListResultsByVersion(ctx, v.ID, domain.ListOptions{})

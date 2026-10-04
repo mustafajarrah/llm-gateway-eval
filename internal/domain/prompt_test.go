@@ -231,20 +231,25 @@ func TestEvaluationResultJSON(t *testing.T) {
 
 func TestSummarize(t *testing.T) {
 	got := Summarize([]EvaluationResult{
-		{Passed: true, Usage: TokenUsage{InputTokens: 10, OutputTokens: 2}, Latency: 100 * time.Millisecond},
-		{Passed: false, Usage: TokenUsage{InputTokens: 5, OutputTokens: 1}, Latency: 50 * time.Millisecond},
+		{Passed: true, Usage: TokenUsage{InputTokens: 10, OutputTokens: 2}, Latency: 100 * time.Millisecond, CostUSD: ptr(0.25)},
+		{Passed: false, Usage: TokenUsage{InputTokens: 5, OutputTokens: 1}, Latency: 50 * time.Millisecond, CostUSD: ptr(0.5)},
+		// Consumed tokens but has no price.
+		{Passed: true, Usage: TokenUsage{InputTokens: 4, OutputTokens: 1}},
+		// Never reached a provider: neither priced nor unpriced.
 		{Error: "provider down"},
 	})
 	want := RunSummary{
-		Total: 3, Passed: 1, Failed: 1, Errored: 1,
-		Usage:          TokenUsage{InputTokens: 15, OutputTokens: 3},
+		Total: 4, Passed: 2, Failed: 1, Errored: 1,
+		Usage:          TokenUsage{InputTokens: 19, OutputTokens: 4},
+		CostUSD:        0.75,
+		Unpriced:       1,
 		TotalLatencyMS: 150,
 	}
 	if got != want {
 		t.Errorf("Summarize() = %+v, want %+v", got, want)
 	}
-	if rate := got.PassRate(); rate < 0.333 || rate > 0.334 {
-		t.Errorf("PassRate() = %v, want 1/3", rate)
+	if rate := got.PassRate(); rate != 0.5 {
+		t.Errorf("PassRate() = %v, want 1/2", rate)
 	}
 	if rate := (RunSummary{}).PassRate(); rate != 0 {
 		t.Errorf("PassRate() of empty summary = %v, want 0", rate)

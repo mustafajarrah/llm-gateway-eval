@@ -34,6 +34,7 @@ type Gateway interface {
 	Routes() []domain.Route
 	// Circuits reports each provider's circuit breaker state.
 	Circuits() map[domain.Provider]string
+	Prices() []domain.ModelPrice
 }
 
 // Evaluator runs and compares evaluation runs.
@@ -298,6 +299,9 @@ type providersResponse struct {
 	// Circuits maps each provider to "closed", "open" or "half_open". It is
 	// empty when circuit breaking is disabled.
 	Circuits map[domain.Provider]string `json:"circuits"`
+	// Prices are the configured per-model prices, in US dollars per million
+	// tokens.
+	Prices []domain.ModelPrice `json:"prices"`
 }
 
 func (a *api) listProviders(w http.ResponseWriter, _ *http.Request) {
@@ -305,6 +309,7 @@ func (a *api) listProviders(w http.ResponseWriter, _ *http.Request) {
 		Providers: a.gateway.Providers(),
 		Routes:    a.gateway.Routes(),
 		Circuits:  a.gateway.Circuits(),
+		Prices:    a.gateway.Prices(),
 	})
 }
 
